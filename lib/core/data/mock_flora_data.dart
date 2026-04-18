@@ -1,0 +1,1 @@
+// Mock data removed in V2 — all data is now real (filesystem, OpenAI API).

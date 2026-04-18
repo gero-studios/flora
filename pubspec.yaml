@@ -1,0 +1,30 @@
+name: flora
+description: "Flora is an enterprise Flutter AI coding workspace prototype."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.1
+
+dependencies:
+  file_selector: ^1.1.0
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^3.3.1
+  google_fonts: ^8.0.2
+  http: ^1.6.0
+  path: ^1.9.1
+  shared_preferences: ^2.5.5
+  vm_service: ^15.0.2
+  webview_flutter: ^4.13.1
+  webview_windows: ^0.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/logo.png
