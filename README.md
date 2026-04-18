@@ -4,10 +4,6 @@
   <img src="assets/logo.png" alt="Flora logo" width="260" />
 </p>
 
-<p align="center">
-  <strong>Code. Preview. Chat.</strong>
-</p>
-
 Flora is a Flutter desktop workspace for building Flutter apps with a tighter feedback loop. It combines a project-aware chat assistant, an embedded app preview, and DevTools-driven inspection in one glassy interface so you can stay in the flow while you work.
 
 Instead of bouncing between a code editor, a browser window, and a separate debugger, Flora keeps the core development tools together. The app preview can run inside Flora itself, and the inspector context can be captured directly from the currently selected widget so assistant prompts can stay precise and targeted.
