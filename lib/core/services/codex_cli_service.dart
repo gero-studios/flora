@@ -48,6 +48,12 @@ class CodexCliCommandResult {
     this.eventTimeline = const [],
     this.modelThoughts = const [],
     this.completionMessage,
+    this.modifiedFiles = const [],
+    this.linesAdded = 0,
+    this.linesRemoved = 0,
+    this.executionStrategy = 'direct-prompt',
+    this.taskFilePath,
+    this.submittedPrimaryTask,
   });
 
   final bool success;
@@ -58,6 +64,12 @@ class CodexCliCommandResult {
   final List<String> eventTimeline;
   final List<String> modelThoughts;
   final String? completionMessage;
+  final List<String> modifiedFiles;
+  final int linesAdded;
+  final int linesRemoved;
+  final String executionStrategy;
+  final String? taskFilePath;
+  final String? submittedPrimaryTask;
 
   String get combinedOutput {
     final parts = <String>[
@@ -175,6 +187,9 @@ class CodexCliService {
         'model_reasoning_effort="$normalizedReasoningEffort"',
         '--json',
         '--ephemeral',
+        '--full-auto',
+        '--sandbox',
+        'workspace-write',
         '--skip-git-repo-check',
         '--cd',
         workingDirectory,

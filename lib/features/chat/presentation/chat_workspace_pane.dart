@@ -29,6 +29,77 @@ const _chatCopilotModelOptions = <String>[
   'o4-mini',
 ];
 
+String _normalizeProjectPath(String value) {
+  final normalized = p.normalize(p.absolute(value.trim()));
+  return Platform.isWindows ? normalized.toLowerCase() : normalized;
+}
+
+bool _isPathInsideProjectRoot(String projectRoot, String candidatePath) {
+  final normalizedRoot = _normalizeProjectPath(projectRoot);
+  final normalizedPath = _normalizeProjectPath(candidatePath);
+  return normalizedPath == normalizedRoot ||
+      p.isWithin(normalizedRoot, normalizedPath);
+}
+
+String? _projectScopedPath(String? candidatePath, String? projectRoot) {
+  if (projectRoot == null || projectRoot.trim().isEmpty) {
+    return null;
+  }
+  if (candidatePath == null || candidatePath.trim().isEmpty) {
+    return null;
+  }
+  return _isPathInsideProjectRoot(projectRoot, candidatePath)
+      ? candidatePath
+      : null;
+}
+
+bool _looksLikeDeicticTask(String value) {
+  final normalized = value.trim().toLowerCase();
+  if (normalized.isEmpty) {
+    return false;
+  }
+
+  return RegExp(
+    r'\b(this|that|it|this one|that one|selected|remove this|delete this|change this|fix this)\b',
+  ).hasMatch(normalized);
+}
+
+InspectorSelectionContext? _projectScopedInspectorSelection(
+  InspectorSelectionContext? selection,
+  String? projectRoot,
+) {
+  if (selection == null) {
+    return null;
+  }
+  if (projectRoot == null || projectRoot.trim().isEmpty) {
+    return null;
+  }
+
+  final sourceFile = selection.sourceFile;
+  if (sourceFile == null || sourceFile.trim().isEmpty) {
+    return null;
+  }
+
+  return _isPathInsideProjectRoot(projectRoot, sourceFile) ? selection : null;
+}
+
+List<ChatMessage> _recentPromptHistory(List<ChatMessage> history) {
+  final resolved = history.where((message) {
+    if (message.isStreaming) {
+      return false;
+    }
+    if (message.role != MessageRole.user) {
+      return false;
+    }
+    return message.content.trim().isNotEmpty;
+  }).toList();
+
+  if (resolved.length <= 8) {
+    return resolved;
+  }
+  return resolved.sublist(resolved.length - 8);
+}
+
 class _ProviderStatusSnapshot {
   const _ProviderStatusSnapshot({
     required this.installed,
@@ -56,6 +127,9 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
   final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
   final _inputFocus = FocusNode();
+  bool _requestInFlight = false;
+  String? _lastSubmittedText;
+  DateTime? _lastSubmittedAt;
 
   @override
   void dispose() {
@@ -65,17 +139,54 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     super.dispose();
   }
 
-  String? _readActiveFile() {
-    final path = ref.read(activeFilePathProvider);
-    if (path == null) {
-      return null;
-    }
-
+  String? _readFile(String path) {
     try {
       return File(path).readAsStringSync();
     } catch (_) {
       return null;
     }
+  }
+
+  String? _readFileExcerpt(
+    String path, {
+    required int? startLine,
+    required int? endLine,
+    int contextRadius = 4,
+  }) {
+    final raw = _readFile(path);
+    if (raw == null) {
+      return null;
+    }
+
+    final lines = raw.split('\n');
+    if (lines.isEmpty) {
+      return null;
+    }
+
+    final anchorStart = startLine == null || startLine < 1 ? 1 : startLine;
+    final anchorEnd = endLine == null || endLine < anchorStart
+        ? anchorStart
+        : endLine;
+
+    final excerptStart = anchorStart - contextRadius < 1
+        ? 1
+        : anchorStart - contextRadius;
+    final excerptEnd = anchorEnd + contextRadius > lines.length
+        ? lines.length
+        : anchorEnd + contextRadius;
+
+    final excerpt = <String>[];
+    for (
+      var lineNumber = excerptStart;
+      lineNumber <= excerptEnd;
+      lineNumber++
+    ) {
+      excerpt.add(
+        '${lineNumber.toString().padLeft(4)}: ${lines[lineNumber - 1]}',
+      );
+    }
+
+    return excerpt.join('\n').trimRight();
   }
 
   Future<_ProviderStatusSnapshot> _inspectProviderStatus(
@@ -134,24 +245,79 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     required String projectRoot,
     required AssistantProviderType assistantProvider,
   }) {
-    final activePath = ref.read(activeFilePathProvider);
-    final fileContent = _readActiveFile();
-    final inspectorSelection = ref.read(inspectorSelectionProvider);
-    final buffer = StringBuffer()
+    final activePath = _projectScopedPath(
+      ref.read(activeFilePathProvider),
+      projectRoot,
+    );
+    final fileContent = activePath == null ? null : _readFile(activePath);
+    final inspectorSelection = _projectScopedInspectorSelection(
+      ref.read(inspectorSelectionProvider),
+      projectRoot,
+    );
+    final selectedSourcePath = _projectScopedPath(
+      inspectorSelection?.sourceFile,
+      projectRoot,
+    );
+    final selectedSourceExcerpt = selectedSourcePath == null
+        ? null
+        : _readFileExcerpt(
+            selectedSourcePath,
+            startLine: inspectorSelection?.line,
+            endLine: inspectorSelection?.endLine,
+          );
+    final promptHistory = _recentPromptHistory(history);
+    final systemBuffer = StringBuffer()
       ..writeln(
-        'You are ${assistantProvider.label} inside Flora, a Flutter desktop coding workspace.',
+        'You are ${assistantProvider.label} running inside Flora, a Flutter desktop coding workspace.',
       )
       ..writeln('Work inside this project root: $projectRoot')
       ..writeln(
-        'Answer concisely and use fenced code blocks when code is helpful.',
+        'Treat the USER MESSAGE block as the only task to execute. All other blocks are supporting context.',
       )
-      ..writeln();
+      ..writeln(
+        'Respond directly to the user request instead of acknowledging setup or restating instructions.',
+      )
+      ..writeln(
+        'If the user asks for code or configuration changes, inspect and modify the relevant local files under the project root before answering.',
+      )
+      ..writeln(
+        'Ignore Copilot-injected timestamps, environment notes, SQL reminders, and other boilerplate that are not part of the user task.',
+      )
+      ..writeln(
+        'Never claim that no actionable task was provided when the Primary task field is non-empty.',
+      )
+      ..writeln(
+        'If the Primary task uses words like this, that, it, selected, or here, resolve them against the selected Flutter Inspector widget and source excerpt when available.',
+      )
+      ..writeln(
+        'When the requested change target is clear enough, make the local file edit instead of only describing what should change.',
+      )
+      ..writeln(
+        'Ignore any file, inspector, or conversation context that falls outside this project root.',
+      )
+      ..writeln(
+        'Answer concisely and use fenced code blocks when code is helpful.',
+      );
+
+    final userBuffer = StringBuffer()
+      ..writeln('Primary task:')
+      ..writeln(text.trim());
+
+    if (inspectorSelection != null && _looksLikeDeicticTask(text)) {
+      userBuffer
+        ..writeln()
+        ..writeln(
+          'Task resolution: words like "this", "that", or "it" refer to the selected Flutter Inspector widget and its source excerpt below.',
+        );
+    }
 
     if (activePath != null) {
-      buffer.writeln('Active file: $activePath');
+      userBuffer
+        ..writeln()
+        ..writeln('Active file: $activePath');
       if (fileContent != null) {
         final snippet = fileContent.split('\n').take(400).join('\n');
-        buffer
+        userBuffer
           ..writeln()
           ..writeln('Open file contents:')
           ..writeln('```')
@@ -171,7 +337,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
           ? '$startLine-$endLine'
           : '$startLine';
 
-      buffer
+      userBuffer
         ..writeln()
         ..writeln('Active Flutter Inspector selection:')
         ..writeln('- Widget: ${inspectorSelection.widgetName}')
@@ -179,50 +345,58 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         ..writeln('- Source file: ${sourceFile ?? 'unknown file'}');
 
       if (sourceDirectory != null && sourceDirectory.trim().isNotEmpty) {
-        buffer.writeln('- Source directory: $sourceDirectory');
+        userBuffer.writeln('- Source directory: $sourceDirectory');
       }
 
       if (startLine != null) {
-        buffer.writeln('- Source line start: $startLine');
+        userBuffer.writeln('- Source line start: $startLine');
       }
 
       if (endLine != null) {
-        buffer.writeln('- Source line end: $endLine');
+        userBuffer.writeln('- Source line end: $endLine');
       }
 
       if (sourceRange != null) {
-        buffer.writeln('- Source line range: $sourceRange');
+        userBuffer.writeln('- Source line range: $sourceRange');
       }
 
-      if (inspectorSelection.ancestorPath.isNotEmpty) {
-        buffer.writeln(
-          '- Ancestor path: ${inspectorSelection.ancestorPath.join(' > ')}',
-        );
+      if (selectedSourceExcerpt != null && selectedSourceExcerpt.isNotEmpty) {
+        userBuffer
+          ..writeln()
+          ..writeln('Selected widget source excerpt:')
+          ..writeln('```dart')
+          ..writeln(selectedSourceExcerpt)
+          ..writeln('```');
       }
     }
 
-    if (history.isNotEmpty) {
-      buffer
+    if (promptHistory.isNotEmpty) {
+      userBuffer
         ..writeln()
-        ..writeln('Recent conversation:');
-      for (final message in history.take(8)) {
+        ..writeln('Recent conversation (most recent last):');
+      for (final message in promptHistory) {
         final role = switch (message.role) {
           MessageRole.user => 'User',
           MessageRole.assistant => 'Assistant',
           MessageRole.system => 'System',
         };
-        buffer
+        userBuffer
           ..writeln('$role:')
           ..writeln(message.content.trim())
           ..writeln();
       }
     }
 
-    buffer
-      ..writeln('Current user request:')
-      ..writeln(text);
+    final promptBuffer = StringBuffer()
+      ..writeln('--- SYSTEM INSTRUCTIONS ---')
+      ..writeln(systemBuffer.toString().trimRight())
+      ..writeln('--- END SYSTEM INSTRUCTIONS ---')
+      ..writeln()
+      ..writeln('--- USER MESSAGE ---')
+      ..writeln(userBuffer.toString().trimRight())
+      ..writeln('--- END USER MESSAGE ---');
 
-    return buffer.toString();
+    return promptBuffer.toString();
   }
 
   Future<void> _send() async {
@@ -231,10 +405,27 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       return;
     }
 
+    if (_requestInFlight || ref.read(chatLoadingProvider)) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final recentDuplicate =
+        _lastSubmittedText == text &&
+        _lastSubmittedAt != null &&
+        now.difference(_lastSubmittedAt!) < const Duration(seconds: 2);
+    if (recentDuplicate) {
+      return;
+    }
+
     final projectRoot = ref.read(projectRootProvider);
     if (projectRoot == null || projectRoot.trim().isEmpty) {
       return;
     }
+
+    _requestInFlight = true;
+    _lastSubmittedText = text;
+    _lastSubmittedAt = now;
 
     final selectedAssistant = ref.read(assistantProvider);
     final history = ref.read(chatHistoryProvider);
@@ -245,6 +436,9 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         selectedAssistant == AssistantProviderType.codex
         ? ref.read(codexReasoningEffortProvider)
         : ref.read(copilotReasoningEffortProvider);
+    final selectedCopilotPermissionMode = ref.read(
+      copilotPermissionModeProvider,
+    );
     final inspectorSelection = ref.read(inspectorSelectionProvider);
     final statusBeforeFuture = _inspectProviderStatus(selectedAssistant);
     final prompt = _buildPrompt(
@@ -254,7 +448,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       assistantProvider: selectedAssistant,
     );
     final assistantMessageId = '${DateTime.now().millisecondsSinceEpoch}_a';
-    final now = DateTime.now();
 
     _inputCtrl.clear();
 
@@ -308,6 +501,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
               workingDirectory: projectRoot,
               model: selectedModel,
               reasoningEffort: selectedReasoningEffort,
+              permissionMode: selectedCopilotPermissionMode,
               onProgress: (update) =>
                   _handleProgressUpdate(assistantMessageId, update),
             );
@@ -331,26 +525,44 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       final completionStatus = result.success
           ? '${selectedAssistant.label} completed in ${durationMs}ms (exit ${result.exitCode ?? 0}).'
           : '${selectedAssistant.label} failed in ${durationMs}ms (exit ${result.exitCode ?? -1}).';
+      final modificationSummary = result.modifiedFiles.isEmpty
+          ? ''
+          : '\nModified ${result.modifiedFiles.length} file(s) (${result.linesAdded}+, ${result.linesRemoved}-).';
       final completionSummary =
           completionMessage.isNotEmpty && completionMessage != content.trim()
-          ? '$completionStatus\n$completionMessage'
-          : completionStatus;
+          ? '$completionStatus$modificationSummary\n$completionMessage'
+          : '$completionStatus$modificationSummary';
 
+      // Key execution facts are placed first so they remain visible within the
+      // 16-line monospace cap in _MessageMetaBlock.  Event timeline entries
+      // follow immediately after so the execution log is always reachable.
       final debugLines = <String>[
-        'provider ${selectedAssistant.key}',
-        'connection.before installed=${statusBefore.installed} authenticated=${statusBefore.authenticated} mode=${statusBefore.mode}',
-        'connection.before.label ${statusBefore.badgeLabel}',
-        'exec.model $selectedModel',
-        'exec.reasoning $selectedReasoningEffort',
-        if (result.commandLine.trim().isNotEmpty)
-          'exec.command ${result.commandLine}',
-        'exec.cwd $projectRoot',
         'exec.success ${result.success}',
         'exec.exit ${result.exitCode ?? -1}',
         'exec.duration_ms $durationMs',
+        'provider ${selectedAssistant.key}',
+        'exec.strategy ${result.executionStrategy}',
+        if (selectedAssistant == AssistantProviderType.copilot)
+          'exec.permissions ${selectedCopilotPermissionMode.key}',
+        'exec.user_request ${_truncateDebug(text, 180)}',
+        if (result.submittedPrimaryTask != null)
+          'exec.primary_task ${_truncateDebug(result.submittedPrimaryTask!, 180)}',
+        'exec.model $selectedModel',
+        'exec.reasoning $selectedReasoningEffort',
+        if (result.taskFilePath != null)
+          'exec.task_file ${p.basename(result.taskFilePath!)}',
+        'exec.modified_files ${result.modifiedFiles.length}',
+        'exec.diff_stats added=${result.linesAdded} removed=${result.linesRemoved}',
+        ...result.modifiedFiles.take(4).map((file) => 'exec.file $file'),
         if (result.stderr.trim().isNotEmpty)
           'exec.stderr ${result.stderr.trim()}',
         ...result.eventTimeline.map((event) => 'event $event'),
+        'connection.before installed=${statusBefore.installed} authenticated=${statusBefore.authenticated} mode=${statusBefore.mode}',
+        'connection.before.label ${statusBefore.badgeLabel}',
+        'exec.prompt_history_users ${promptHistoryCount(history)}',
+        'exec.cwd $projectRoot',
+        if (result.commandLine.trim().isNotEmpty)
+          'exec.command ${result.commandLine}',
         if (statusAfter != null)
           'connection.after installed=${statusAfter.installed} authenticated=${statusAfter.authenticated} mode=${statusAfter.mode} label=${statusAfter.badgeLabel}',
       ];
@@ -365,7 +577,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         reasoningEffort: selectedReasoningEffort,
         assistantProvider: selectedAssistant,
         completionSummary: completionSummary,
-        debugLines: debugLines.take(24).toList(),
+        debugLines: debugLines.take(40).toList(),
         thoughts: result.modelThoughts,
         isStreaming: false,
       );
@@ -391,6 +603,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       );
       _replaceChatMessage(assistantMessageId, (_) => assistantMsg);
     } finally {
+      _requestInFlight = false;
       ref.read(chatLoadingProvider.notifier).state = false;
       _scrollToBottom();
     }
@@ -422,7 +635,9 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
     _replaceChatMessage(
       assistantMessageId,
       (message) => message.copyWith(
-        content: update.status,
+        content: update.streamedContent?.trim().isNotEmpty == true
+            ? update.streamedContent!
+            : update.status,
         thoughts: update.thoughts,
         debugLines: update.events,
         isStreaming: !update.isFinal,
@@ -441,6 +656,18 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         );
       }
     });
+  }
+
+  int promptHistoryCount(List<ChatMessage> history) {
+    return _recentPromptHistory(history).length;
+  }
+
+  String _truncateDebug(String value, int maxChars) {
+    final normalized = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized.length <= maxChars) {
+      return normalized;
+    }
+    return '${normalized.substring(0, maxChars)}...';
   }
 
   @override
@@ -601,6 +828,11 @@ class _ChatBody extends ConsumerWidget {
     final active = ref.watch(activeFilePathProvider);
     final root = ref.watch(projectRootProvider);
     final inspectorSelection = ref.watch(inspectorSelectionProvider);
+    final scopedActive = _projectScopedPath(active, root);
+    final scopedInspectorSelection = _projectScopedInspectorSelection(
+      inspectorSelection,
+      root,
+    );
     final selectedAssistant = ref.watch(assistantProvider);
     final usingCodex = selectedAssistant == AssistantProviderType.codex;
     final selectedModel = usingCodex
@@ -647,18 +879,18 @@ class _ChatBody extends ConsumerWidget {
           right: 10,
           child: _ChatContextFloater(
             projectRoot: root,
-            activeFilePath: active,
-            inspectorLabel: inspectorSelection == null
+            activeFilePath: scopedActive,
+            inspectorLabel: scopedInspectorSelection == null
                 ? null
-                : _formatInspectorSelectionLabel(inspectorSelection),
+                : _formatInspectorSelectionLabel(scopedInspectorSelection),
             assistantProvider: selectedAssistant,
             model: selectedModel,
             reasoningEffort: selectedReasoningEffort,
             modelOptions: modelOptions,
-            onClearActiveFile: active == null
+            onClearActiveFile: scopedActive == null
                 ? null
                 : () => ref.read(activeFilePathProvider.notifier).state = null,
-            onClearInspector: inspectorSelection == null
+            onClearInspector: scopedInspectorSelection == null
                 ? null
                 : () => ref.read(inspectorSelectionProvider.notifier).state =
                       null,
@@ -1137,9 +1369,6 @@ class _MessageInspectorAttachment extends StatelessWidget {
         : (endLine != null && endLine >= startLine)
         ? '$sourceLabel:$startLine-$endLine'
         : '$sourceLabel:$startLine';
-    final lineage = selection.ancestorPath.isEmpty
-        ? null
-        : selection.ancestorPath.take(4).join(' > ');
 
     return Container(
       width: double.infinity,
@@ -1186,13 +1415,6 @@ class _MessageInspectorAttachment extends StatelessWidget {
               fontSize: 11,
             ),
           ),
-          if (lineage != null) ...[
-            const SizedBox(height: 4),
-            Text(
-              lineage,
-              style: FloraTheme.mono(size: 10, color: FloraPalette.textDimmed),
-            ),
-          ],
         ],
       ),
     );
@@ -1214,9 +1436,10 @@ class _MessageMetaBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final maxVisibleLines = monospace ? 16 : 12;
     final visibleLines = lines
         .where((line) => line.trim().isNotEmpty)
-        .take(12)
+        .take(maxVisibleLines)
         .toList(growable: true);
 
     if (lines.length > visibleLines.length) {

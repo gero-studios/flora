@@ -52,6 +52,11 @@ final copilotReasoningEffortInitialProvider = Provider<String>(
   (ref) => 'medium',
 );
 
+/// Injected at startup from SharedPreferences (see main.dart).
+final copilotPermissionModeInitialProvider = Provider<CopilotPermissionMode>(
+  (ref) => CopilotPermissionMode.workspaceWrite,
+);
+
 /// Live-writable copy. Write here to update the key at runtime.
 final openAIKeyProvider = StateProvider<String?>((ref) {
   return ref.watch(openAIKeyInitialProvider);
@@ -101,6 +106,12 @@ final copilotModelProvider = StateProvider<String>((ref) {
 
 final copilotReasoningEffortProvider = StateProvider<String>((ref) {
   return ref.watch(copilotReasoningEffortInitialProvider);
+});
+
+final copilotPermissionModeProvider = StateProvider<CopilotPermissionMode>((
+  ref,
+) {
+  return ref.watch(copilotPermissionModeInitialProvider);
 });
 
 // Trigger integer to prompt a hot reload from anywhere

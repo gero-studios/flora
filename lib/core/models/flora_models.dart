@@ -6,6 +6,8 @@ enum LogLevel { info, warning, error }
 
 enum AssistantProviderType { codex, copilot }
 
+enum CopilotPermissionMode { readOnly, workspaceWrite, fullAuto }
+
 /// Feature flag for enabling or disabling Codex integration in Flora.
 const bool codexIntegrationEnabled = true;
 
@@ -52,6 +54,59 @@ extension AssistantProviderTypeX on AssistantProviderType {
         return 'Codex';
       case AssistantProviderType.copilot:
         return 'GitHub Copilot';
+    }
+  }
+}
+
+CopilotPermissionMode copilotPermissionModeFromKey(String? value) {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'read_only':
+    case 'read-only':
+    case 'readonly':
+      return CopilotPermissionMode.readOnly;
+    case 'full_auto':
+    case 'full-auto':
+    case 'fullauto':
+      return CopilotPermissionMode.fullAuto;
+    case 'workspace_write':
+    case 'workspace-write':
+    case 'workspacewrite':
+    default:
+      return CopilotPermissionMode.workspaceWrite;
+  }
+}
+
+extension CopilotPermissionModeX on CopilotPermissionMode {
+  String get key {
+    switch (this) {
+      case CopilotPermissionMode.readOnly:
+        return 'read_only';
+      case CopilotPermissionMode.workspaceWrite:
+        return 'workspace_write';
+      case CopilotPermissionMode.fullAuto:
+        return 'full_auto';
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case CopilotPermissionMode.readOnly:
+        return 'Read only';
+      case CopilotPermissionMode.workspaceWrite:
+        return 'Workspace edits';
+      case CopilotPermissionMode.fullAuto:
+        return 'Full auto';
+    }
+  }
+
+  String get description {
+    switch (this) {
+      case CopilotPermissionMode.readOnly:
+        return 'No write auto-approval. In Flora prompt mode, edit requests will be denied.';
+      case CopilotPermissionMode.workspaceWrite:
+        return 'Auto-approve tools for non-interactive runs while keeping file access limited to the project directory and explicitly allowed paths.';
+      case CopilotPermissionMode.fullAuto:
+        return 'Auto-approve all tools and paths for the current session.';
     }
   }
 }
@@ -191,12 +246,14 @@ class AssistantExecutionUpdate {
     required this.status,
     this.thoughts = const [],
     this.events = const [],
+    this.streamedContent,
     this.isFinal = false,
   });
 
   final String status;
   final List<String> thoughts;
   final List<String> events;
+  final String? streamedContent;
   final bool isFinal;
 }
 

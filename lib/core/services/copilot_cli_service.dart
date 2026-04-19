@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:path/path.dart' as p;
 
 import '../models/flora_models.dart';
 import 'codex_cli_service.dart';
@@ -96,7 +99,7 @@ class CopilotCliService {
           installed: true,
           mode: CopilotAuthMode.loggedOut,
           message: authText.ifEmpty(
-            'Run gh auth login and then copilot login.',
+            'Run gh auth login to sign in with GitHub.',
           ),
         );
       }
@@ -137,8 +140,75 @@ class CopilotCliService {
     return result;
   }
 
-  static Future<CodexCliCommandResult> login() {
-    return _run('copilot', const ['login']);
+  static Future<CodexCliCommandResult> login({
+    void Function(String detail)? onProgress,
+  }) async {
+    const arguments = [
+      'auth',
+      'login',
+      '--web',
+      '--clipboard',
+      '--git-protocol',
+      'https',
+      '--skip-ssh-key',
+    ];
+
+    try {
+      final process = await Process.start('gh', arguments, runInShell: true);
+      final stdoutBuffer = StringBuffer();
+      final stderrBuffer = StringBuffer();
+      final visibleLines = <String>[];
+      String? deviceCode;
+
+      void emitDetail(String line) {
+        final trimmed = _stripAnsi(line).trim();
+        if (trimmed.isEmpty) {
+          return;
+        }
+
+        visibleLines.add(trimmed);
+        deviceCode ??= _extractDeviceCode(trimmed);
+        onProgress?.call(_buildLoginProgress(visibleLines, deviceCode));
+      }
+
+      onProgress?.call(_buildLoginProgress(const [], null));
+
+      final stdoutDone = process.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            stdoutBuffer.writeln(line);
+            emitDetail(line);
+          })
+          .asFuture<void>();
+      final stderrDone = process.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            stderrBuffer.writeln(line);
+            emitDetail(line);
+          })
+          .asFuture<void>();
+
+      final exitCode = await process.exitCode;
+      await Future.wait([stdoutDone, stderrDone]);
+
+      return CodexCliCommandResult(
+        success: exitCode == 0,
+        exitCode: exitCode,
+        stdout: stdoutBuffer.toString(),
+        stderr: stderrBuffer.toString(),
+        commandLine:
+            'gh auth login --web --clipboard --git-protocol https --skip-ssh-key',
+      );
+    } on ProcessException catch (error) {
+      return CodexCliCommandResult(
+        success: false,
+        exitCode: null,
+        stdout: '',
+        stderr: error.message,
+      );
+    }
   }
 
   static Future<CodexCliCommandResult> logout() {
@@ -153,25 +223,85 @@ class CopilotCliService {
     );
   }
 
+  static String commandPreview({
+    required String model,
+    required String reasoningEffort,
+    required CopilotPermissionMode permissionMode,
+  }) {
+    final arguments = [
+      '-p',
+      '<flora_compact_task_prompt_with_@brief>',
+      '--add-dir',
+      '<project root>',
+      '--add-dir',
+      '<temp task dir>',
+      '--no-custom-instructions',
+      ..._permissionArguments(permissionMode),
+      '--stream',
+      'on',
+      '--output-format',
+      'json',
+      '--model',
+      model.trim().isEmpty ? 'gpt-5.2' : model.trim(),
+      '--reasoning-effort',
+      _normalizeReasoningEffort(reasoningEffort),
+    ];
+    return _formatCommandLine(arguments);
+  }
+
   static Future<CodexCliCommandResult> execPrompt({
     required String prompt,
     required String workingDirectory,
     String model = 'gpt-5.2',
     String reasoningEffort = 'medium',
+    CopilotPermissionMode permissionMode = CopilotPermissionMode.workspaceWrite,
     void Function(AssistantExecutionUpdate update)? onProgress,
   }) async {
+    Directory? tempDir;
     final normalizedModel = model.trim().isEmpty ? 'gpt-5.2' : model.trim();
     final normalizedReasoningEffort = _normalizeReasoningEffort(
       reasoningEffort,
     );
 
     try {
+      tempDir = await Directory.systemTemp.createTemp('flora_copilot_');
+      final taskFilePath = p.join(tempDir.path, 'flora_task.md');
+      final taskFile = File(taskFilePath);
+      final compactTaskBrief = _buildCompactTaskBrief(prompt);
+      await taskFile.writeAsString(compactTaskBrief);
+
+      final submittedPrimaryTask = _extractPrimaryTask(prompt);
+      // Normalize path separators because prompt-mode @file mentions and tool
+      // path parsing are more reliable with forward slashes on Windows.
+      final driverTaskPath = taskFilePath.replaceAll('\\', '/');
+      final driverWorkingDirectory = workingDirectory.replaceAll('\\', '/');
+      final driverPrompt = StringBuffer()
+        ..writeln(
+          'Read @$driverTaskPath and execute the Primary task from that attached file.',
+        )
+        ..writeln('Treat that file as the source of truth for the task.')
+        ..writeln('Work only inside this project root: $driverWorkingDirectory')
+        ..writeln(
+          'Modify local files if needed instead of only describing the change.',
+        )
+        ..writeln(
+          'Prefer apply_patch and file edit tools for local changes. Avoid shell-based file writes on Windows.',
+        )
+        ..writeln('Return a concise summary of the result when finished.');
+
+      final permissionArguments = _permissionArguments(permissionMode);
+
       final arguments = [
         '-p',
-        prompt,
-        '--allow-all-tools',
+        driverPrompt.toString().trimRight(),
+        '--add-dir',
+        workingDirectory,
+        '--add-dir',
+        tempDir.path,
+        '--no-custom-instructions',
+        ...permissionArguments,
         '--stream',
-        'off',
+        'on',
         '--output-format',
         'json',
         '--model',
@@ -187,17 +317,32 @@ class CopilotCliService {
         runInShell: true,
       );
 
-      final commandLine = 'copilot ${arguments.map(_shellQuote).join(' ')}';
+      final commandLine = _formatCommandLine(arguments);
       final stdoutBuffer = StringBuffer();
       final stderrBuffer = StringBuffer();
-      final eventTimeline = <String>[];
+      final eventTimeline = <String>[
+        'prompt.original chars=${prompt.length}',
+        'task_brief chars=${compactTaskBrief.length}',
+      ];
       final modelThoughts = <String>[];
+      final streamedMessageBuffers = <String, StringBuffer>{};
+      final modifiedFiles = <String>[];
+      var linesAdded = 0;
+      var linesRemoved = 0;
       String completionMessage = '';
       String statusLine = 'Starting Copilot…';
+      String liveContent = '';
 
-      void emitProgress({String? status, bool isFinal = false}) {
+      void emitProgress({
+        String? status,
+        String? streamedContent,
+        bool isFinal = false,
+      }) {
         if (status != null && status.trim().isNotEmpty) {
           statusLine = status.trim();
+        }
+        if (streamedContent != null) {
+          liveContent = streamedContent;
         }
 
         onProgress?.call(
@@ -205,6 +350,7 @@ class CopilotCliService {
             status: statusLine,
             thoughts: _tail(modelThoughts, 4),
             events: _tail(eventTimeline, 8),
+            streamedContent: liveContent.isEmpty ? null : liveContent,
             isFinal: isFinal,
           ),
         );
@@ -224,6 +370,29 @@ class CopilotCliService {
                   completionMessage = text.trim();
                 }
               },
+              onStreamingDeltaDetected: (messageId, deltaContent) {
+                final buffer = streamedMessageBuffers.putIfAbsent(
+                  messageId,
+                  StringBuffer.new,
+                );
+                buffer.write(deltaContent);
+                emitProgress(
+                  status: 'Writing response…',
+                  streamedContent: buffer.toString(),
+                );
+              },
+              onStreamingMessageDetected: (messageId, content) {
+                streamedMessageBuffers[messageId] = StringBuffer()
+                  ..write(content);
+                emitProgress(streamedContent: content);
+              },
+              onCodeChangesDetected: (files, added, removed) {
+                modifiedFiles
+                  ..clear()
+                  ..addAll(files);
+                linesAdded = added;
+                linesRemoved = removed;
+              },
             );
             emitProgress(status: progressStatus);
           })
@@ -242,7 +411,24 @@ class CopilotCliService {
           .asFuture<void>();
 
       emitProgress(status: 'Submitting prompt…');
+
+      // Heartbeat: advance the status label every 6 s so the UI never looks
+      // frozen if Copilot is quiet (e.g. during long planning or tool calls).
+      var heartbeatTick = 0;
+      final heartbeatLabels = [
+        'Waiting for Copilot…',
+        'Copilot is working…',
+        'Still processing…',
+        'Running tools…',
+        'Almost there…',
+      ];
+      final heartbeat = Timer.periodic(const Duration(seconds: 6), (_) {
+        heartbeatTick = (heartbeatTick + 1) % heartbeatLabels.length;
+        emitProgress(status: heartbeatLabels[heartbeatTick]);
+      });
+
       final exitCode = await process.exitCode;
+      heartbeat.cancel();
       await Future.wait([stdoutDone, stderrDone]);
 
       if (completionMessage.isEmpty && modelThoughts.isNotEmpty) {
@@ -264,6 +450,12 @@ class CopilotCliService {
         eventTimeline: eventTimeline,
         modelThoughts: modelThoughts,
         completionMessage: completionMessage.isEmpty ? null : completionMessage,
+        modifiedFiles: modifiedFiles,
+        linesAdded: linesAdded,
+        linesRemoved: linesRemoved,
+        executionStrategy: 'task-file',
+        taskFilePath: taskFilePath,
+        submittedPrimaryTask: submittedPrimaryTask,
       );
     } on ProcessException catch (error) {
       return CodexCliCommandResult(
@@ -271,7 +463,12 @@ class CopilotCliService {
         exitCode: null,
         stdout: '',
         stderr: error.message,
+        executionStrategy: 'task-file',
       );
+    } finally {
+      if (tempDir != null && await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
     }
   }
 
@@ -306,11 +503,36 @@ class CopilotCliService {
     ].join('\n\n');
   }
 
+  static String _buildLoginProgress(List<String> lines, String? deviceCode) {
+    final detailLines = <String>[
+      'GitHub sign-in is running in your browser.',
+      if (deviceCode != null)
+        'One-time device code copied to clipboard: $deviceCode'
+      else
+        'If GitHub asks for a one-time code, it should already be in your clipboard.',
+    ];
+
+    final recentLines = _tail(lines, 6);
+    if (recentLines.isNotEmpty) {
+      detailLines
+        ..add('')
+        ..addAll(recentLines);
+    }
+
+    return detailLines.join('\n');
+  }
+
   static String? _captureJsonEvent({
     required String line,
     required List<String> eventTimeline,
     required List<String> modelThoughts,
     required void Function(String text) onCompletionDetected,
+    required void Function(String messageId, String deltaContent)
+    onStreamingDeltaDetected,
+    required void Function(String messageId, String content)
+    onStreamingMessageDetected,
+    required void Function(List<String> files, int added, int removed)
+    onCodeChangesDetected,
   }) {
     final trimmed = line.trim();
     if (trimmed.isEmpty) {
@@ -331,35 +553,165 @@ class CopilotCliService {
     }
 
     final type = decoded['type']?.toString() ?? 'unknown';
-    if (type == 'assistant.message') {
+    if (type == 'assistant.turn_start') {
+      eventTimeline.add('assistant.turn_start');
+      return 'Planning next steps…';
+    }
+
+    if (type == 'user.message') {
       final data = decoded['data'];
       if (data is Map) {
         final content = data['content']?.toString() ?? '';
-        final phase = data['phase']?.toString() ?? 'unknown';
+        final primaryTask = _extractPrimaryTask(content);
         eventTimeline.add(
-          'assistant.message phase=$phase chars=${content.length}',
+          primaryTask == null
+              ? 'user.message chars=${content.length}'
+              : 'user.message primary_task=${_truncate(primaryTask, 120)}',
+        );
+      } else {
+        eventTimeline.add('user.message');
+      }
+      return 'Task submitted…';
+    }
+
+    if (type == 'assistant.message') {
+      final data = decoded['data'];
+      if (data is Map) {
+        final messageId = data['messageId']?.toString() ?? '';
+        final content = data['content']?.toString() ?? '';
+        final phase = data['phase']?.toString() ?? 'unknown';
+        final toolRequests = data['toolRequests'];
+        final toolRequestCount = toolRequests is List ? toolRequests.length : 0;
+        eventTimeline.add(
+          'assistant.message phase=$phase chars=${content.length} tool_requests=$toolRequestCount',
         );
         if (content.trim().isNotEmpty) {
           modelThoughts.add(content.trim());
-          if (phase == 'final_answer') {
+          if (messageId.isNotEmpty &&
+              (phase == 'final_answer' ||
+                  phase == 'complete' ||
+                  phase == 'final' ||
+                  phase == 'response')) {
+            onStreamingMessageDetected(messageId, content);
+          }
+          if (phase == 'final_answer' ||
+              phase == 'complete' ||
+              phase == 'final' ||
+              phase == 'response') {
             onCompletionDetected(content);
           }
         }
+        if (toolRequestCount > 0) {
+          return 'Preparing tool actions…';
+        }
         return switch (phase) {
           'analysis' => 'Thinking…',
-          'final_answer' => 'Writing final answer…',
+          'final_answer' ||
+          'complete' ||
+          'final' ||
+          'response' => 'Writing final answer…',
           'tool_call' => 'Using a tool…',
           _ => 'Working…',
         };
       } else {
-        eventTimeline.add('assistant.message');
+        // Some CLI versions put content at the top level (no 'data' wrapper).
+        final topContent = decoded['content']?.toString() ?? '';
+        if (topContent.trim().isNotEmpty) {
+          modelThoughts.add(topContent.trim());
+          eventTimeline.add(
+            'assistant.message (top-level) chars=${topContent.length}',
+          );
+          onCompletionDetected(topContent);
+        } else {
+          eventTimeline.add('assistant.message');
+        }
       }
       return 'Working…';
+    }
+
+    if (type == 'assistant.message_delta') {
+      final data = decoded['data'];
+      if (data is Map) {
+        final messageId = data['messageId']?.toString() ?? '';
+        final deltaContent = data['deltaContent']?.toString() ?? '';
+        eventTimeline.add(
+          'assistant.message_delta chars=${deltaContent.length}',
+        );
+        if (messageId.isNotEmpty && deltaContent.isNotEmpty) {
+          onStreamingDeltaDetected(messageId, deltaContent);
+          return 'Writing response…';
+        }
+      } else {
+        eventTimeline.add('assistant.message_delta');
+      }
+      return 'Writing response…';
+    }
+
+    if (type == 'tool.execution_start') {
+      final data = decoded['data'];
+      if (data is Map) {
+        final toolName = data['toolName']?.toString() ?? 'tool';
+        eventTimeline.add('tool.execution_start $toolName');
+        return _toolProgressLabel(toolName, starting: true);
+      }
+      eventTimeline.add('tool.execution_start');
+      return 'Using a tool…';
+    }
+
+    if (type == 'tool.execution_complete') {
+      final data = decoded['data'];
+      if (data is Map) {
+        final toolName = data['toolName']?.toString() ?? 'tool';
+        final success = data['success'];
+        final error = data['error'];
+        if (error is Map) {
+          final code = error['code']?.toString() ?? 'unknown';
+          final message = error['message']?.toString() ?? '';
+          eventTimeline.add(
+            'tool.execution_complete $toolName success=$success error=$code ${_truncate(message, 120)}',
+          );
+          if (code == 'denied') {
+            return 'Permission blocked $toolName…';
+          }
+        } else {
+          eventTimeline.add(
+            'tool.execution_complete $toolName success=$success',
+          );
+        }
+        return _toolProgressLabel(toolName, starting: false);
+      }
+      eventTimeline.add('tool.execution_complete');
+      return 'Processing tool results…';
+    }
+
+    if (type.startsWith('session.')) {
+      eventTimeline.add(type);
+      return switch (type) {
+        'session.mcp_server_status_changed' => 'Connecting tools…',
+        'session.mcp_servers_loaded' => 'Loading tools…',
+        'session.skills_loaded' => 'Loading skills…',
+        'session.tools_updated' => 'Preparing tool access…',
+        _ => 'Starting Copilot…',
+      };
     }
 
     if (type == 'result') {
       final resultExit = decoded['exitCode']?.toString() ?? '?';
       eventTimeline.add('result exit=$resultExit');
+
+      // Extract the final response text that the Copilot agent places in the
+      // result envelope (used when no assistant.message final-phase event was
+      // emitted, e.g. with older or non-streaming CLI versions).
+      final resultOutput =
+          decoded['output']?.toString() ??
+          decoded['message']?.toString() ??
+          decoded['text']?.toString() ??
+          '';
+      if (resultOutput.trim().isNotEmpty) {
+        onCompletionDetected(resultOutput.trim());
+        eventTimeline.add('result.output chars=${resultOutput.trim().length}');
+      }
+
       final usage = decoded['usage'];
       if (usage is Map) {
         final totalApiDuration = usage['totalApiDurationMs']?.toString() ?? '?';
@@ -367,6 +719,28 @@ class CopilotCliService {
         eventTimeline.add(
           'usage total_api_ms=$totalApiDuration session_ms=$sessionDuration',
         );
+
+        final codeChanges = usage['codeChanges'];
+        if (codeChanges is Map) {
+          final files = <String>[];
+          final rawFiles = codeChanges['filesModified'];
+          if (rawFiles is List) {
+            for (final file in rawFiles) {
+              final resolved = file?.toString().trim() ?? '';
+              if (resolved.isNotEmpty) {
+                files.add(resolved);
+              }
+            }
+          }
+
+          final added = _parseInt(codeChanges['linesAdded']);
+          final removed = _parseInt(codeChanges['linesRemoved']);
+          onCodeChangesDetected(files, added, removed);
+
+          eventTimeline.add(
+            'code_changes files=${files.length} lines_added=$added lines_removed=$removed',
+          );
+        }
       }
       return 'Finalizing…';
     }
@@ -379,6 +753,275 @@ class CopilotCliService {
     const allowed = {'low', 'medium', 'high', 'xhigh'};
     final effort = input.trim().toLowerCase();
     return allowed.contains(effort) ? effort : 'medium';
+  }
+
+  static int _parseInt(Object? value) {
+    if (value is int) {
+      return value;
+    }
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  static String _toolProgressLabel(String toolName, {required bool starting}) {
+    final normalized = toolName.trim().toLowerCase();
+    final action = switch (normalized) {
+      'apply_patch' => starting ? 'Updating files…' : 'Files updated…',
+      'powershell' => starting ? 'Running PowerShell…' : 'PowerShell finished…',
+      'view' => starting ? 'Reading task brief…' : 'Task brief loaded…',
+      'read_file' =>
+        starting ? 'Reading project files…' : 'Project files loaded…',
+      'search' =>
+        starting ? 'Searching the codebase…' : 'Search results ready…',
+      'report_intent' => starting ? 'Clarifying plan…' : 'Plan clarified…',
+      _ => starting ? 'Using $toolName…' : 'Processed $toolName output…',
+    };
+    return action;
+  }
+
+  static String? _extractPrimaryTask(String prompt) {
+    final match = RegExp(
+      r'Primary task:\s*([\s\S]*?)(?:\n\n|\n[A-Z][^\n]*:|\n--- END USER MESSAGE ---|$)',
+      caseSensitive: false,
+    ).firstMatch(prompt);
+    final raw = match?.group(1)?.trim();
+    if (raw == null || raw.isEmpty) {
+      return null;
+    }
+    return raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  static String _buildCompactTaskBrief(String prompt) {
+    final systemSection = _extractPromptSection(prompt, 'SYSTEM INSTRUCTIONS');
+    final userSection = _extractPromptSection(prompt, 'USER MESSAGE');
+    final primaryTask =
+        _extractPrimaryTask(prompt) ?? userSection.ifEmpty(prompt);
+    final taskResolution = _extractNamedParagraph(
+      userSection,
+      'Task resolution:',
+    );
+    final activeFile = _extractSingleLineValue(userSection, 'Active file:');
+    final inspectorMetadata = _extractBulletedBlock(
+      userSection,
+      'Active Flutter Inspector selection:',
+    );
+    final recentConversation = _extractRecentConversation(userSection);
+    final hasInlineFileContents = userSection.contains('Open file contents:');
+    final hasSourceExcerpt = userSection.contains(
+      'Selected widget source excerpt:',
+    );
+    final needsInspectorResolution = systemSection.contains(
+      'If the Primary task uses words like this, that, it, selected, or here',
+    );
+
+    final buffer = StringBuffer()
+      ..writeln('Primary task:')
+      ..writeln(primaryTask.trim());
+
+    if (taskResolution != null ||
+        (needsInspectorResolution && inspectorMetadata.isNotEmpty)) {
+      buffer
+        ..writeln()
+        ..writeln('Task resolution:')
+        ..writeln(
+          taskResolution ??
+              'Words like "this", "that", "it", "selected", or "here" refer to the Flutter Inspector metadata below.',
+        );
+    }
+
+    if (activeFile != null) {
+      buffer
+        ..writeln()
+        ..writeln('Active file: $activeFile');
+    }
+
+    if (inspectorMetadata.isNotEmpty) {
+      buffer
+        ..writeln()
+        ..writeln('Active Flutter Inspector selection:');
+      for (final line in inspectorMetadata) {
+        buffer.writeln('- ${_truncate(line, 220)}');
+      }
+    }
+
+    if (recentConversation.isNotEmpty) {
+      buffer
+        ..writeln()
+        ..writeln('Recent conversation summary:');
+      for (final entry in recentConversation) {
+        buffer.writeln('- $entry');
+      }
+    }
+
+    if (hasInlineFileContents || hasSourceExcerpt) {
+      buffer
+        ..writeln()
+        ..writeln('Token-saving note:')
+        ..writeln(
+          'Inline file contents and source excerpts were omitted intentionally. Inspect local files only when needed.',
+        );
+    }
+
+    return buffer.toString().trimRight();
+  }
+
+  static String _extractPromptSection(String prompt, String sectionName) {
+    final escaped = RegExp.escape(sectionName);
+    final match = RegExp(
+      '--- $escaped ---\\s*([\\s\\S]*?)\\s*--- END $escaped ---',
+      caseSensitive: false,
+    ).firstMatch(prompt);
+    return match?.group(1)?.trim() ?? '';
+  }
+
+  static String? _extractSingleLineValue(String text, String prefix) {
+    for (final line in LineSplitter.split(text)) {
+      if (line.startsWith(prefix)) {
+        final value = line.substring(prefix.length).trim();
+        return value.isEmpty ? null : value;
+      }
+    }
+    return null;
+  }
+
+  static String? _extractNamedParagraph(String text, String heading) {
+    final lines = LineSplitter.split(text).toList(growable: false);
+    final startIndex = lines.indexWhere((line) => line.trim() == heading);
+    if (startIndex == -1) {
+      return null;
+    }
+
+    final collected = <String>[];
+    for (var index = startIndex + 1; index < lines.length; index++) {
+      final trimmed = lines[index].trim();
+      if (trimmed.isEmpty || trimmed.startsWith('```')) {
+        break;
+      }
+      collected.add(trimmed);
+    }
+
+    if (collected.isEmpty) {
+      return null;
+    }
+
+    return collected.join(' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  static List<String> _extractBulletedBlock(String text, String heading) {
+    final lines = LineSplitter.split(text).toList(growable: false);
+    final startIndex = lines.indexWhere((line) => line.trim() == heading);
+    if (startIndex == -1) {
+      return const [];
+    }
+
+    final collected = <String>[];
+    for (var index = startIndex + 1; index < lines.length; index++) {
+      final trimmed = lines[index].trim();
+      if (trimmed.isEmpty) {
+        break;
+      }
+      if (!trimmed.startsWith('- ')) {
+        break;
+      }
+      collected.add(trimmed.substring(2).trim());
+    }
+
+    return List<String>.unmodifiable(collected);
+  }
+
+  static List<String> _extractRecentConversation(String text) {
+    final lines = LineSplitter.split(text).toList(growable: false);
+    final startIndex = lines.indexWhere(
+      (line) => line.trim() == 'Recent conversation (most recent last):',
+    );
+    if (startIndex == -1) {
+      return const [];
+    }
+
+    final entries = <String>[];
+    String? currentRole;
+    var currentContent = <String>[];
+
+    void flush() {
+      if (currentRole == null || currentContent.isEmpty) {
+        currentRole = null;
+        currentContent = <String>[];
+        return;
+      }
+
+      final content = currentContent
+          .join(' ')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      if (content.isNotEmpty) {
+        entries.add('$currentRole: ${_truncate(content, 180)}');
+      }
+      currentRole = null;
+      currentContent = <String>[];
+    }
+
+    for (var index = startIndex + 1; index < lines.length; index++) {
+      final trimmed = lines[index].trim();
+      if (trimmed.isEmpty) {
+        flush();
+        continue;
+      }
+
+      if (trimmed == 'User:' ||
+          trimmed == 'Assistant:' ||
+          trimmed == 'System:') {
+        flush();
+        currentRole = trimmed.substring(0, trimmed.length - 1);
+        continue;
+      }
+
+      if (currentRole != null) {
+        currentContent.add(trimmed);
+      }
+    }
+
+    flush();
+    return _tail(entries, 2);
+  }
+
+  static List<String> _permissionArguments(CopilotPermissionMode mode) {
+    final arguments = <String>[];
+
+    switch (mode) {
+      case CopilotPermissionMode.readOnly:
+        break;
+      case CopilotPermissionMode.workspaceWrite:
+        // GitHub's CLI requires auto-approval in prompt mode; pre-approve all
+        // tools while keeping file access constrained to the working dir and
+        // explicitly added directories.
+        arguments.add('--allow-all-tools');
+        break;
+      case CopilotPermissionMode.fullAuto:
+        arguments.add('--allow-all-tools');
+        arguments.add('--allow-all-paths');
+        break;
+    }
+
+    if (Platform.isWindows) {
+      arguments.add('--excluded-tools=powershell');
+    }
+
+    return arguments;
+  }
+
+  static String _formatCommandLine(List<String> arguments) {
+    final escaped = arguments.map(_shellQuote).join(' ');
+    return 'copilot $escaped';
+  }
+
+  static String? _extractDeviceCode(String value) {
+    final match = RegExp(
+      r'\b[A-Z0-9]{4}(?:-[A-Z0-9]{4})+\b',
+    ).firstMatch(value.toUpperCase());
+    return match?.group(0);
+  }
+
+  static String _stripAnsi(String value) {
+    return value.replaceAll(RegExp(r'\x1B\[[0-?]*[ -/]*[@-~]'), '');
   }
 
   static String _shellQuote(String value) {

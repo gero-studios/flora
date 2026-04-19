@@ -189,6 +189,43 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
     });
   }
 
+  Future<void> _runCopilotSignIn() async {
+    setState(() {
+      _busy = true;
+      _busyLabel = 'Starting GitHub sign-in...';
+      _statusDetail =
+          'Opening the GitHub sign-in flow. Flora will mirror the latest login details here.';
+      _commandOutput = '';
+    });
+
+    final result = await CopilotCliService.login(
+      onProgress: (detail) {
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          _statusDetail = detail;
+        });
+      },
+    );
+    await _refreshProviderStatus(showBusy: false);
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _busy = false;
+      _busyLabel = '';
+      _commandOutput = result.combinedOutput.trim().isEmpty
+          ? (result.success
+                ? 'GitHub sign-in completed.'
+                : 'GitHub sign-in failed.')
+          : result.combinedOutput;
+    });
+  }
+
   Future<void> _pickProjectRoot() async {
     final directory = await getDirectoryPath(confirmButtonText: 'Open project');
     if (directory == null || directory.trim().isEmpty) {
@@ -208,7 +245,9 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
     });
 
     final prefs = await SharedPreferences.getInstance();
+    final previousRoot = ref.read(projectRootProvider)?.trim() ?? '';
     final root = _rootCtrl.text.trim();
+    final rootChanged = previousRoot != root;
     final selectedProvider = normalizeAssistantProvider(
       ref.read(assistantProvider),
     );
@@ -218,6 +257,7 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
     final copilotReasoningEffort = ref
         .read(copilotReasoningEffortProvider)
         .trim();
+    final copilotPermissionMode = ref.read(copilotPermissionModeProvider);
 
     await prefs.setString('assistant_provider', selectedProvider.key);
 
@@ -237,6 +277,7 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
       'copilot_reasoning_effort',
       copilotReasoningEffort.isEmpty ? 'medium' : copilotReasoningEffort,
     );
+    await prefs.setString('copilot_permission_mode', copilotPermissionMode.key);
 
     if (root.isEmpty) {
       await prefs.remove('project_root');
@@ -248,6 +289,10 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
       ref.read(expandedFoldersProvider.notifier).state = {root};
     }
     ref.read(activeFilePathProvider.notifier).state = null;
+    ref.read(inspectorSelectionProvider.notifier).state = null;
+    if (rootChanged) {
+      ref.read(chatHistoryProvider.notifier).state = const [];
+    }
 
     if (!mounted) {
       return;
@@ -276,6 +321,7 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
     final copilotLabel = ref.watch(copilotAuthLabelProvider);
     final copilotModel = ref.watch(copilotModelProvider);
     final copilotReasoningEffort = ref.watch(copilotReasoningEffortProvider);
+    final copilotPermissionMode = ref.watch(copilotPermissionModeProvider);
 
     final providerInstalled = usingCodex ? codexInstalled : copilotInstalled;
     final providerAuthenticated = usingCodex
@@ -292,6 +338,14 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
     final providerReasoningEffort = usingCodex
         ? codexReasoningEffort
         : copilotReasoningEffort;
+    final installLabel = providerInstalled
+        ? 'Already Installed'
+        : (usingCodex ? 'Install Codex CLI' : 'Install Copilot CLI');
+    final signInLabel = !providerInstalled
+        ? (usingCodex ? 'Install Codex First' : 'Install Copilot First')
+        : providerAuthenticated
+        ? 'Already Signed In'
+        : (usingCodex ? 'Sign In With ChatGPT' : 'Sign In With GitHub');
 
     final selectedModel = modelOptions.contains(providerModel)
         ? providerModel
@@ -556,11 +610,74 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
                     ),
                   ],
                 ),
+                if (!usingCodex) ...[
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Execution permissions',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: FloraPalette.textSecondary,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    height: 32,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    decoration: BoxDecoration(
+                      color: FloraPalette.background,
+                      border: Border.all(color: FloraPalette.border),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<CopilotPermissionMode>(
+                        value: copilotPermissionMode,
+                        isExpanded: true,
+                        iconSize: 16,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: FloraPalette.textPrimary,
+                        ),
+                        dropdownColor: FloraPalette.panelBg,
+                        items:
+                            const [
+                                  CopilotPermissionMode.workspaceWrite,
+                                  CopilotPermissionMode.fullAuto,
+                                ]
+                                .map(
+                                  (mode) =>
+                                      DropdownMenuItem<CopilotPermissionMode>(
+                                        value: mode,
+                                        child: Text(mode.label),
+                                      ),
+                                )
+                                .toList(),
+                        onChanged: _busy || _saving
+                            ? null
+                            : (value) {
+                                if (value == null) return;
+                                ref
+                                        .read(
+                                          copilotPermissionModeProvider
+                                              .notifier,
+                                        )
+                                        .state =
+                                    value;
+                                setState(() => _saved = false);
+                              },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'GitHub Copilot prompt mode does not request permissions interactively. Flora therefore uses pre-approved execution modes here. ${copilotPermissionMode.description}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
                 const SizedBox(height: 6),
                 Text(
                   usingCodex
-                      ? 'Exact Codex reference passed to exec: -m $selectedModel --config model_reasoning_effort="$selectedReasoning"'
-                      : 'Exact Copilot reference passed to exec: --model $selectedModel --reasoning-effort $selectedReasoning --allow-all-tools --stream off --output-format json',
+                      ? 'Exact Codex reference passed to exec: codex exec - -m $selectedModel --config model_reasoning_effort="$selectedReasoning" --json --ephemeral --full-auto --sandbox workspace-write --skip-git-repo-check --cd <project root> --output-last-message <temp file>'
+                      : 'Exact Copilot reference passed to exec: ${CopilotCliService.commandPreview(model: selectedModel, reasoningEffort: selectedReasoning, permissionMode: copilotPermissionMode)}',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 const SizedBox(height: 12),
@@ -577,20 +694,18 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
                             borderRadius: BorderRadius.circular(6),
                           ),
                         ),
-                        onPressed: _busy
+                        onPressed: _busy || providerInstalled
                             ? null
                             : () => _runProviderAction(
                                 usingCodex
                                     ? 'Installing Codex CLI...'
-                                    : 'Checking GitHub Copilot CLI...',
+                                    : 'Installing GitHub Copilot CLI...',
                                 usingCodex
                                     ? CodexCliService.install
                                     : CopilotCliService.install,
                               ),
                         child: Text(
-                          usingCodex
-                              ? 'Install Codex CLI'
-                              : 'Install Copilot CLI',
+                          installLabel,
                           style: const TextStyle(fontSize: 11),
                         ),
                       ),
@@ -604,20 +719,17 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
                             borderRadius: BorderRadius.circular(6),
                           ),
                         ),
-                        onPressed: _busy
+                        onPressed:
+                            _busy || !providerInstalled || providerAuthenticated
                             ? null
-                            : () => _runProviderAction(
-                                usingCodex
-                                    ? 'Waiting for ChatGPT sign-in...'
-                                    : 'Opening GitHub login flow...',
-                                usingCodex
-                                    ? CodexCliService.loginWithChatgpt
-                                    : CopilotCliService.login,
-                              ),
+                            : usingCodex
+                            ? () => _runProviderAction(
+                                'Waiting for ChatGPT sign-in...',
+                                CodexCliService.loginWithChatgpt,
+                              )
+                            : _runCopilotSignIn,
                         child: Text(
-                          usingCodex
-                              ? 'Sign In With ChatGPT'
-                              : 'Sign In With GitHub',
+                          signInLabel,
                           style: const TextStyle(fontSize: 11),
                         ),
                       ),
@@ -689,7 +801,9 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
                   _InfoSurface(
                     title: _busy ? _busyLabel : 'Status',
                     body: _busy
-                        ? 'The command is running. Browser login may take a moment.'
+                        ? (_statusDetail.trim().isEmpty
+                              ? 'The command is running. Browser login may take a moment.'
+                              : _statusDetail)
                         : _statusDetail,
                   ),
                 ],

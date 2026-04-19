@@ -23,6 +23,15 @@ void main() async {
   final storedCopilotModel = prefs.getString('copilot_model') ?? 'gpt-5.2';
   final storedCopilotReasoningEffort =
       prefs.getString('copilot_reasoning_effort') ?? 'medium';
+  var storedCopilotPermissionMode = copilotPermissionModeFromKey(
+    prefs.getString('copilot_permission_mode'),
+  );
+  if (storedCopilotPermissionMode == CopilotPermissionMode.readOnly) {
+    // Prompt mode (-p) can no longer request permissions interactively, so a
+    // persisted read-only setting causes all edit attempts to fail. Migrate to
+    // workspace-write so Copilot can edit within the opened project.
+    storedCopilotPermissionMode = CopilotPermissionMode.workspaceWrite;
+  }
   final codexStatus = codexIntegrationEnabled
       ? await CodexCliService.inspectStatus()
       : const CodexCliStatus(
@@ -61,6 +70,9 @@ void main() async {
         copilotModelInitialProvider.overrideWithValue(storedCopilotModel),
         copilotReasoningEffortInitialProvider.overrideWithValue(
           storedCopilotReasoningEffort,
+        ),
+        copilotPermissionModeInitialProvider.overrideWithValue(
+          storedCopilotPermissionMode,
         ),
       ],
       child: const FloraApp(),
