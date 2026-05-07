@@ -6,6 +6,7 @@ import 'package:flora/core/models/flora_models.dart';
 import 'package:flora/app/theme/flora_theme.dart';
 import 'package:flora/core/state/flora_providers.dart';
 import 'package:flora/features/chat/presentation/chat_workspace_pane.dart';
+import 'package:flora/features/onboarding/presentation/onboarding_overlay.dart';
 import 'package:flora/features/sidebar/presentation/project_sidebar_pane.dart';
 import 'package:flora/features/shell/presentation/settings_overlay.dart';
 
@@ -120,6 +121,7 @@ class _FloraShellState extends ConsumerState<FloraShell> {
 
   @override
   Widget build(BuildContext context) {
+    final onboardingComplete = ref.watch(onboardingCompleteProvider);
     return Scaffold(
       extendBodyBehindAppBar: true,
       body: Stack(
@@ -188,6 +190,7 @@ class _FloraShellState extends ConsumerState<FloraShell> {
             SettingsOverlay(
               onClose: () => setState(() => _settingsOpen = false),
             ),
+          if (!onboardingComplete) const OnboardingOverlay(),
         ],
       ),
     );
