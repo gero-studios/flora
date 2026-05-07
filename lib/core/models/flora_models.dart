@@ -55,7 +55,7 @@ extension AssistantProviderTypeX on AssistantProviderType {
       case AssistantProviderType.codex:
         return 'Codex';
       case AssistantProviderType.copilot:
-        return 'GitHub Copilot';
+        return 'Command Code';
     }
   }
 }
@@ -104,11 +104,11 @@ extension CopilotPermissionModeX on CopilotPermissionMode {
   String get description {
     switch (this) {
       case CopilotPermissionMode.readOnly:
-        return 'No write auto-approval. In Flora prompt mode, edit requests will be denied.';
+        return 'Do not pass Command Code the non-interactive write grant. Edit requests will usually fail.';
       case CopilotPermissionMode.workspaceWrite:
-        return 'Auto-approve tools for non-interactive runs while keeping file access limited to the project directory and explicitly allowed paths. On Windows, direct shell execution is denied in this mode so edits use native file tools.';
+        return 'Use Command Code print mode with non-interactive write approval and keep scope anchored to the project root and Flora task files via --add-dir.';
       case CopilotPermissionMode.fullAuto:
-        return 'Auto-approve all tools and paths for the current session.';
+        return 'Currently the same execution profile as Workspace edits in Flora because Command Code print mode exposes a single non-interactive permission grant.';
     }
   }
 }
@@ -128,7 +128,7 @@ extension PreviewInteractionModeX on PreviewInteractionMode {
       case PreviewInteractionMode.use:
         return 'Use App';
       case PreviewInteractionMode.annotate:
-        return 'Annotate UI';
+        return 'DevTools Inspect';
     }
   }
 
@@ -137,7 +137,7 @@ extension PreviewInteractionModeX on PreviewInteractionMode {
       case PreviewInteractionMode.use:
         return 'Interact with the running app normally. Your last UI target stays attached for chat until you clear it.';
       case PreviewInteractionMode.annotate:
-        return 'Browse a Flora-owned screen map of the current widget tree, then target the right layout container without freezing the app preview.';
+        return 'Use the embedded Flutter DevTools inspector to select a widget, then keep that target attached for chat and edits.';
     }
   }
 }
@@ -394,6 +394,7 @@ class ChatMessage {
     this.completionSummary,
     this.debugLines = const [],
     this.isStreaming = false,
+    this.suggestedFollowUps = const [],
   });
 
   final String id;
@@ -408,6 +409,7 @@ class ChatMessage {
   final String? completionSummary;
   final List<String> debugLines;
   final bool isStreaming;
+  final List<String> suggestedFollowUps;
 
   ChatMessage copyWith({
     String? id,
@@ -422,6 +424,7 @@ class ChatMessage {
     String? completionSummary,
     List<String>? debugLines,
     bool? isStreaming,
+    List<String>? suggestedFollowUps,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -436,6 +439,7 @@ class ChatMessage {
       completionSummary: completionSummary ?? this.completionSummary,
       debugLines: debugLines ?? this.debugLines,
       isStreaming: isStreaming ?? this.isStreaming,
+      suggestedFollowUps: suggestedFollowUps ?? this.suggestedFollowUps,
     );
   }
 }

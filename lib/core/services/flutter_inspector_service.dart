@@ -12,7 +12,12 @@ class FlutterInspectorService {
   const FlutterInspectorService._();
 
   static const String _selectionObjectGroup = 'flora_inspector_selection_group';
-  static const String _selectionModeExtension = 'ext.flutter.inspector.show';
+  static const String _modernSelectionModeExtension =
+    'ext.flutter.inspector.selectMode';
+  static const String _legacySelectionModeExtension =
+    'ext.flutter.inspector.show';
+  static const String _inspectorEnableExtension =
+    'ext.flutter.inspector.enable';
 
   static Future<void> configureProjectRoots({
     required String vmServiceUrl,
@@ -375,12 +380,31 @@ class FlutterInspectorService {
             String isolateId,
             Set<String> extensions,
           ) async {
-            if (!extensions.contains(_selectionModeExtension)) {
+            if (extensions.contains(_modernSelectionModeExtension)) {
+              if (extensions.contains(_inspectorEnableExtension)) {
+                await service.callServiceExtension(
+                  _inspectorEnableExtension,
+                  isolateId: isolateId,
+                  args: <String, dynamic>{'enabled': 'true'},
+                );
+              }
+
+              await service.callServiceExtension(
+                _modernSelectionModeExtension,
+                isolateId: isolateId,
+                args: <String, dynamic>{
+                  'enabled': enabled ? 'true' : 'false',
+                },
+              );
+              return true;
+            }
+
+            if (!extensions.contains(_legacySelectionModeExtension)) {
               return false;
             }
 
             await service.callServiceExtension(
-              _selectionModeExtension,
+              _legacySelectionModeExtension,
               isolateId: isolateId,
               args: <String, dynamic>{'enabled': enabled ? 'true' : 'false'},
             );

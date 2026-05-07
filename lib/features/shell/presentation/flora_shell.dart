@@ -18,16 +18,18 @@ class GlassWindow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final showTitleIcon = title == 'Chat Assistant';
+
     return Container(
       decoration: BoxDecoration(
         color: FloraPalette.glassPanel,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: FloraPalette.glassBorder, width: 0.5),
+        border: Border.all(color: FloraPalette.glassBorder, width: 1),
         boxShadow: const [
           BoxShadow(
-            color: Colors.black12,
-            blurRadius: 24,
-            offset: Offset(0, 8),
+            color: Color(0x66000000),
+            blurRadius: 32,
+            offset: Offset(0, 14),
           ),
         ],
       ),
@@ -36,12 +38,9 @@ class GlassWindow extends StatelessWidget {
         child: BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 40, sigmaY: 40),
           child: Container(
-            decoration: BoxDecoration(
+            decoration: const BoxDecoration(
               gradient: LinearGradient(
-                colors: [
-                  Colors.white.withAlpha(150),
-                  Colors.white.withAlpha(70),
-                ],
+                colors: [Color(0xFF1A2028), Color(0xFF0F141A)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
@@ -67,6 +66,14 @@ class GlassWindow extends StatelessWidget {
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
+                        if (showTitleIcon) ...[
+                          const Icon(
+                            Icons.auto_awesome_rounded,
+                            size: 14,
+                            color: FloraPalette.textSecondary,
+                          ),
+                          const SizedBox(width: 8),
+                        ],
                         Text(
                           title!,
                           style: const TextStyle(
@@ -122,10 +129,10 @@ class _FloraShellState extends ConsumerState<FloraShell> {
             decoration: const BoxDecoration(
               gradient: LinearGradient(
                 colors: [
-                  Color(0xFFE5E5EA), // Apple light gray
-                  Color(0xFFF2F2F7), // Softer gray
-                  Color(0xFFFFFFFF), // Pure white
-                  Color(0xFFF9F9FB), // Very light gray-blue
+                  Color(0xFF070A0E),
+                  Color(0xFF0D1218),
+                  Color(0xFF111820),
+                  Color(0xFF0A0F14),
                 ],
                 stops: [0.0, 0.4, 0.7, 1.0],
                 begin: Alignment.topLeft,
@@ -209,10 +216,15 @@ class _TitleBar extends ConsumerWidget {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              const Icon(
-                Icons.local_florist,
-                size: 16,
-                color: FloraPalette.accent,
+              ClipRect(
+                child: SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: Transform.scale(
+                    scale: 1.45,
+                    child: Image.asset('assets/logo.png', fit: BoxFit.cover),
+                  ),
+                ),
               ),
               const SizedBox(width: 8),
               const Text(
@@ -318,7 +330,7 @@ class _StatusBar extends ConsumerWidget {
                     ? '${selectedAssistant.label}: $providerLabel'
                     : (usingCodex
                           ? 'Install Codex CLI'
-                          : 'Install GitHub Copilot CLI'),
+                          : 'Install Command Code CLI'),
               ),
             ],
           ),

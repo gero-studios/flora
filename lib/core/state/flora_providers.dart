@@ -35,7 +35,7 @@ final copilotAuthenticatedInitialProvider = Provider<bool>((ref) => false);
 
 /// Injected at startup by probing Copilot authentication state.
 final copilotAuthLabelInitialProvider = Provider<String>(
-  (ref) => 'GitHub Copilot not configured',
+  (ref) => 'Command Code not configured',
 );
 
 /// Injected at startup from SharedPreferences (see main.dart).
@@ -45,7 +45,7 @@ final codexModelInitialProvider = Provider<String>((ref) => 'gpt-5.4-mini');
 final codexReasoningEffortInitialProvider = Provider<String>((ref) => 'medium');
 
 /// Injected at startup from SharedPreferences (see main.dart).
-final copilotModelInitialProvider = Provider<String>((ref) => 'gpt-5.2');
+final copilotModelInitialProvider = Provider<String>((ref) => 'gpt-5.4');
 
 /// Injected at startup from SharedPreferences (see main.dart).
 final copilotReasoningEffortInitialProvider = Provider<String>(

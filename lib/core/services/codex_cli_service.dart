@@ -119,6 +119,24 @@ class CodexCliService {
     _cachedStatusAt = null;
   }
 
+  static String _buildUiFocusedPrompt(String prompt) {
+    final buffer = StringBuffer()
+      ..writeln('HARNESS PRIORITY: UI-FIRST EDITING')
+      ..writeln(
+        '- Treat ambiguous requests like "this", "that", "remove this", or "change this" as referring to the nearest visible, user-facing UI element near the selected Flutter Inspector context, not the most literal widget reference.',
+      )
+      ..writeln(
+        '- Do not anchor on the smallest leaf widget or exact source span unless the user explicitly asks for that exact widget, line, or reference.',
+      )
+      ..writeln(
+        '- Prefer edits that change the rendered UI outcome the user is pointing at.',
+      )
+      ..writeln()
+      ..write(prompt.trimRight());
+
+    return buffer.toString();
+  }
+
   static Future<CodexCliStatus> _inspectStatusUncached() async {
     try {
       final version = await Process.run('codex', const [
@@ -224,6 +242,7 @@ class CodexCliService {
     try {
       tempDir = await Directory.systemTemp.createTemp('flora_codex_');
       final outputPath = p.join(tempDir.path, 'last_message.txt');
+      final harnessedPrompt = _buildUiFocusedPrompt(prompt);
       final arguments = [
         'exec',
         '-',
@@ -304,7 +323,7 @@ class CodexCliService {
           .asFuture<void>();
 
       emitProgress(status: 'Submitting prompt…');
-      process.stdin.write(prompt);
+      process.stdin.write(harnessedPrompt);
       await process.stdin.close();
 
       final exitCode = await process.exitCode;

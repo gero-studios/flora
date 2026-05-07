@@ -1,45 +1,41 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-/// Apple-inspired minimal light/transparent palette.
+/// Dark glass palette used across the Flora shell.
 class FloraPalette {
   const FloraPalette._();
 
   // Backgrounds
-  static const background = Color(
-    0xFFF5F5F7,
-  ); // Apple standard light background
-  static const sidebarBg = Color(0xFFEDEDEF);
-  static const panelBg = Color(0xFFFFFFFF);
-  static const inputBg = Color(0xFFE3E3E8);
-  static const hoveredBg = Color(0xFFE5E5EA);
-  static const selectedBg = Color(0xFF007AFF); // Apple Blue
+  static const background = Color(0xFF0D1218);
+  static const sidebarBg = Color(0xFF10161D);
+  static const panelBg = Color(0xFF141B23);
+  static const inputBg = Color(0xFF1A212B);
+  static const hoveredBg = Color(0xFF212A36);
+  static const selectedBg = Color(0xFF202B38);
 
-  // Glassy variants (light/frosted)
-  static const glassBackground = Color(0x73FFFFFF); // Milky frosted
-  static const glassSidebar = Color(0xB3FFFFFF); // More opaque
-  static const glassPanel = Color(0x66FFFFFF);
-  static const glassBorder = Color(
-    0x33000000,
-  ); // Subtle dark border for frosted look
+  // Glassy variants
+  static const glassBackground = Color(0x7310141A);
+  static const glassSidebar = Color(0xCC0E1318);
+  static const glassPanel = Color(0xC9141A22);
+  static const glassBorder = Color(0x1FFFFFFF);
 
   // Borders / dividers
-  static const border = Color(0x26000000);
+  static const border = Color(0x24FFFFFF);
 
   // Accent
-  static const accent = Color(0xFF007AFF);
-  static const accentLight = Color(0xFF5AC8FA);
+  static const accent = Color(0xFF4FB26B);
+  static const accentLight = Color(0xFF85D79A);
 
   // Status
-  static const success = Color(0xFF34C759);
-  static const warning = Color(0xFFFF9500);
-  static const error = Color(0xFFFF3B30);
+  static const success = Color(0xFF4FB26B);
+  static const warning = Color(0xFFF0B35F);
+  static const error = Color(0xFFE06E6E);
 
   // Text
-  static const textPrimary = Color(0xFF1D1D1F); // Apple dark text
-  static const textSecondary = Color(0xFF86868B);
-  static const textDimmed = Color(0xFF98989D);
-  static const textCode = Color(0xFF24292E);
+  static const textPrimary = Color(0xFFE7EDF3);
+  static const textSecondary = Color(0xFF9AA6B2);
+  static const textDimmed = Color(0xFF6B7785);
+  static const textCode = Color(0xFFD7DEE7);
 }
 
 class FloraTheme {
@@ -47,14 +43,14 @@ class FloraTheme {
 
   static ThemeData theme() {
     const cs = ColorScheme(
-      brightness: Brightness.light,
+      brightness: Brightness.dark,
       primary: FloraPalette.accent,
       onPrimary: Colors.white,
       secondary: FloraPalette.accent,
       onSecondary: Colors.white,
       error: FloraPalette.error,
       onError: Colors.white,
-      surface: FloraPalette.sidebarBg,
+      surface: FloraPalette.panelBg,
       onSurface: FloraPalette.textPrimary,
     );
 
@@ -70,7 +66,7 @@ class FloraTheme {
         space: 1,
       ),
       scrollbarTheme: ScrollbarThemeData(
-        thumbColor: WidgetStateProperty.all(const Color(0x40000000)),
+        thumbColor: WidgetStateProperty.all(const Color(0x40FFFFFF)),
         radius: const Radius.circular(8),
         thickness: WidgetStateProperty.all(6),
       ),
@@ -130,12 +126,12 @@ class FloraTheme {
         ),
         focusedBorder: const OutlineInputBorder(
           borderRadius: BorderRadius.all(Radius.circular(8)),
-          borderSide: BorderSide(color: FloraPalette.accent, width: 2),
+          borderSide: BorderSide(color: FloraPalette.accent, width: 1.4),
         ),
       ),
       textSelectionTheme: const TextSelectionThemeData(
         cursorColor: FloraPalette.accent,
-        selectionColor: Color(0x33007AFF),
+        selectionColor: Color(0x334FB26B),
         selectionHandleColor: FloraPalette.accent,
       ),
     );

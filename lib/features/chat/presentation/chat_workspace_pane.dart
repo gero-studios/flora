@@ -2,33 +2,15 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../app/theme/flora_theme.dart';
 import '../../../core/models/flora_models.dart';
 import '../../../core/services/copilot_cli_service.dart';
 import '../../../core/services/codex_cli_service.dart';
 import '../../../core/state/flora_providers.dart';
-
-const _chatCodexModelOptions = <String>[
-  'gpt-5.4-mini',
-  'gpt-5.4',
-  'gpt-5.3-codex',
-  'gpt-5.1-codex-mini',
-];
-
-const _chatCopilotModelOptions = <String>[
-  'gpt-5.2',
-  'gpt-5.4',
-  'gpt-5.4-mini',
-  'claude-sonnet-4',
-  'claude-3.7-sonnet',
-  'gemini-2.5-pro',
-  'gemini-2.5-flash',
-  'o4-mini',
-];
 
 String _normalizeProjectPath(String value) {
   final normalized = p.normalize(p.absolute(value.trim()));
@@ -61,7 +43,7 @@ bool _looksLikeDeicticTask(String value) {
   }
 
   return RegExp(
-    r'\b(this|that|it|this one|that one|selected|remove this|delete this|change this|fix this)\b',
+    r'\b(this|that|it|this one|that one|selected|remove this|delete this|change this|fix this|update this|move this|hide this)\b',
   ).hasMatch(normalized);
 }
 
@@ -108,6 +90,65 @@ String _summarizeConversationEntry(String value, {int maxChars = 220}) {
   }
   return '${normalized.substring(0, maxChars)}...';
 }
+
+List<String> _extractSuggestedFollowUps(String content) {
+  final lines = content.split('\n');
+  final candidates = <String>[];
+  for (final line in lines) {
+    final trimmed = line.trim();
+    if (trimmed.isEmpty || trimmed.startsWith('```')) continue;
+    String? candidate;
+    if (trimmed.startsWith('- ') ||
+        trimmed.startsWith('\u2022 ') ||
+        trimmed.startsWith('* ')) {
+      candidate = trimmed.substring(2).trim();
+    } else if (RegExp(r'^\d+\.\s').hasMatch(trimmed)) {
+      candidate = trimmed.replaceFirst(RegExp(r'^\d+\.\s+'), '');
+    }
+    if (candidate != null &&
+        candidate.length > 8 &&
+        candidate.length < 90 &&
+        !candidate.contains('`')) {
+      candidates.add(candidate);
+    }
+  }
+  if (candidates.isEmpty) return const [];
+  final start = candidates.length > 3 ? candidates.length - 3 : 0;
+  return List.unmodifiable(candidates.sublist(start));
+}
+
+void _appendComposerText(WidgetRef ref, String text, {bool replace = false}) {
+  final normalized = text.trim();
+  if (normalized.isEmpty) {
+    return;
+  }
+
+  final existing = ref.read(chatComposerTextProvider).trim();
+  ref.read(chatComposerTextProvider.notifier).state =
+      replace || existing.isEmpty ? normalized : '$existing\n\n$normalized';
+}
+
+String _projectRelativeLabel(String path, String? projectRoot) {
+  if (projectRoot == null || projectRoot.trim().isEmpty) {
+    return p.basename(path);
+  }
+
+  final normalizedRoot = p.normalize(projectRoot);
+  final normalizedPath = p.normalize(path);
+  if (normalizedPath == normalizedRoot) {
+    return p.basename(path);
+  }
+
+  if (p.isWithin(normalizedRoot, normalizedPath)) {
+    return p
+        .relative(normalizedPath, from: normalizedRoot)
+        .replaceAll('\\', '/');
+  }
+
+  return p.basename(path);
+}
+
+enum _ContextPanelSection { context, app, inspector, files }
 
 class _ProviderStatusSnapshot {
   const _ProviderStatusSnapshot({
@@ -304,7 +345,10 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         'Never claim that no actionable task was provided when the Primary task field is non-empty.',
       )
       ..writeln(
-        'If the Primary task uses words like this, that, it, selected, or here, resolve them against the selected Flutter Inspector widget and source excerpt when available.',
+        'If the Primary task uses words like this, that, it, selected, or here, resolve them against the selected Flutter Inspector context and source excerpt when available.',
+      )
+      ..writeln(
+        'For ambiguous UI-edit requests, prefer the nearest visible, user-facing UI element around that selection instead of the narrowest leaf widget or exact source span unless the user explicitly asks for the exact widget or reference.',
       )
       ..writeln(
         'When the requested change target is clear enough, make the local file edit instead of only describing what should change.',
@@ -324,7 +368,7 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       userBuffer
         ..writeln()
         ..writeln(
-          'Task resolution: words like "this", "that", or "it" refer to the selected Flutter Inspector widget and its source excerpt below.',
+          'Task resolution: words like "this", "that", or "it" usually refer to the nearest visible UI element around the selected Flutter Inspector context, not the most literal leaf widget or exact source span, unless the user explicitly asks for that exact reference.',
         );
     }
 
@@ -588,6 +632,9 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
         debugLines: debugLines.take(40).toList(),
         thoughts: result.modelThoughts,
         isStreaming: false,
+        suggestedFollowUps: result.success
+            ? _extractSuggestedFollowUps(content)
+            : const [],
       );
       _replaceChatMessage(assistantMessageId, (_) => assistantMsg);
 
@@ -728,8 +775,6 @@ class _ChatWorkspacePaneState extends ConsumerState<ChatWorkspacePane> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _PaneHeader(label: '${selectedAssistant.label.toUpperCase()} CHAT'),
-          const Divider(height: 1),
           Expanded(
             child: !providerInstalled || !providerAuthenticated
                 ? _ProviderGate(
@@ -798,7 +843,7 @@ class _ProviderGate extends ConsumerWidget {
                   ? label
                   : provider == AssistantProviderType.codex
                   ? 'Open Settings to install Codex CLI and sign in with ChatGPT.'
-                  : 'Open Settings to install GitHub Copilot CLI and sign in with GitHub.',
+                  : 'Open Settings to install Command Code CLI and sign in to your Command Code account.',
               style: const TextStyle(
                 color: FloraPalette.textDimmed,
                 fontSize: 11,
@@ -875,51 +920,11 @@ class _ChatBody extends ConsumerWidget {
       root,
     );
     final interactionMode = ref.watch(previewInteractionModeProvider);
-    final activeRequestCount = ref.watch(chatActiveRequestCountProvider);
     final selectedAssistant = ref.watch(assistantProvider);
-    final usingCodex = selectedAssistant == AssistantProviderType.codex;
-    final selectedModel = usingCodex
-        ? ref.watch(codexModelProvider)
-        : ref.watch(copilotModelProvider);
-    final selectedReasoningEffort = usingCodex
-        ? ref.watch(codexReasoningEffortProvider)
-        : ref.watch(copilotReasoningEffortProvider);
-    final modelOptions = usingCodex
-        ? _chatCodexModelOptions
-        : _chatCopilotModelOptions;
-
-    return Stack(
+    return Column(
       children: [
-        Column(
-          children: [
-            Expanded(
-              child: messages.isEmpty
-                  ? Padding(
-                      padding: EdgeInsets.only(top: 76),
-                      child: _EmptyChat(providerLabel: selectedAssistant.label),
-                    )
-                  : ListView.builder(
-                      controller: scrollCtrl,
-                      padding: const EdgeInsets.fromLTRB(8, 76, 8, 8),
-                      itemCount: messages.length,
-                      itemBuilder: (context, index) {
-                        return _MessageTile(message: messages[index]);
-                      },
-                    ),
-            ),
-            const Divider(height: 1),
-            _InputBar(
-              ctrl: inputCtrl,
-              focus: inputFocus,
-              onSend: onSend,
-              placeholder: 'Ask ${selectedAssistant.label}...',
-            ),
-          ],
-        ),
-        Positioned(
-          top: 8,
-          left: 10,
-          right: 10,
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
           child: _ChatContextFloater(
             projectRoot: root,
             activeFilePath: scopedActive,
@@ -927,11 +932,6 @@ class _ChatBody extends ConsumerWidget {
                 ? null
                 : _formatInspectorSelectionLabel(scopedInspectorSelection),
             interactionMode: interactionMode,
-            activeRequestCount: activeRequestCount,
-            assistantProvider: selectedAssistant,
-            model: selectedModel,
-            reasoningEffort: selectedReasoningEffort,
-            modelOptions: modelOptions,
             onClearActiveFile: scopedActive == null
                 ? null
                 : () => ref.read(activeFilePathProvider.notifier).state = null,
@@ -939,18 +939,39 @@ class _ChatBody extends ConsumerWidget {
                 ? null
                 : () => ref.read(inspectorSelectionProvider.notifier).state =
                       null,
-            onModelChanged: (newModel) async {
-              if (newModel == selectedModel) return;
-              final prefs = await SharedPreferences.getInstance();
-              if (selectedAssistant == AssistantProviderType.codex) {
-                await prefs.setString('codex_model', newModel);
-                ref.read(codexModelProvider.notifier).state = newModel;
-              } else {
-                await prefs.setString('copilot_model', newModel);
-                ref.read(copilotModelProvider.notifier).state = newModel;
-              }
-            },
           ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: messages.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.only(top: 32),
+                  child: _EmptyChat(providerLabel: selectedAssistant.label),
+                )
+              : ListView.builder(
+                  controller: scrollCtrl,
+                  padding: const EdgeInsets.fromLTRB(0, 6, 0, 8),
+                  itemCount: messages.length + _followUpCount(messages),
+                  itemBuilder: (context, index) {
+                    if (index == messages.length) {
+                      final followUps = _lastAssistantFollowUps(messages);
+                      return _SuggestedFollowUps(
+                        suggestions: followUps,
+                        onSelect: (text) {
+                          inputCtrl.text = text;
+                          inputFocus.requestFocus();
+                        },
+                      );
+                    }
+                    return _MessageTile(message: messages[index]);
+                  },
+                ),
+        ),
+        _InputBar(
+          ctrl: inputCtrl,
+          focus: inputFocus,
+          onSend: onSend,
+          placeholder: 'Ask ${selectedAssistant.label}...',
         ),
       ],
     );
@@ -973,230 +994,554 @@ class _ChatBody extends ConsumerWidget {
   }
 }
 
-class _ChatContextFloater extends StatelessWidget {
+class _ChatContextFloater extends ConsumerStatefulWidget {
   const _ChatContextFloater({
     required this.projectRoot,
     required this.activeFilePath,
     required this.inspectorLabel,
     required this.interactionMode,
-    required this.activeRequestCount,
-    required this.assistantProvider,
-    required this.model,
-    required this.reasoningEffort,
-    required this.modelOptions,
     required this.onClearActiveFile,
     required this.onClearInspector,
-    required this.onModelChanged,
   });
 
   final String? projectRoot;
   final String? activeFilePath;
   final String? inspectorLabel;
   final PreviewInteractionMode interactionMode;
-  final int activeRequestCount;
-  final AssistantProviderType assistantProvider;
-  final String model;
-  final String reasoningEffort;
-  final List<String> modelOptions;
   final VoidCallback? onClearActiveFile;
   final VoidCallback? onClearInspector;
-  final ValueChanged<String> onModelChanged;
+
+  @override
+  ConsumerState<_ChatContextFloater> createState() =>
+      _ChatContextFloaterState();
+}
+
+class _ChatContextFloaterState extends ConsumerState<_ChatContextFloater> {
+  _ContextPanelSection? _openSection;
+
+  void _toggleSection(_ContextPanelSection section) {
+    setState(() {
+      _openSection = _openSection == section ? null : section;
+    });
+  }
+
+  Widget _buildExpandedPanel() {
+    final selectedAssistant = ref.watch(assistantProvider);
+    final usingCodex = selectedAssistant == AssistantProviderType.codex;
+    final selectedModel = usingCodex
+        ? ref.watch(codexModelProvider)
+        : ref.watch(copilotModelProvider);
+    final selectedReasoning = usingCodex
+        ? ref.watch(codexReasoningEffortProvider)
+        : ref.watch(copilotReasoningEffortProvider);
+    final authLabel = usingCodex
+        ? ref.watch(codexAuthLabelProvider)
+        : ref.watch(copilotAuthLabelProvider);
+    final activeRequests = ref.watch(chatActiveRequestCountProvider);
+    final activeFileLabel = widget.activeFilePath == null
+        ? 'No active file attached'
+        : _projectRelativeLabel(widget.activeFilePath!, widget.projectRoot);
+
+    switch (_openSection) {
+      case _ContextPanelSection.context:
+        return _ContextPanel(
+          icon: Icons.auto_awesome_rounded,
+          title: 'Current context',
+          summary:
+              'Use these live workspace details to steer the next prompt without restating your setup.',
+          details: [
+            _ContextInfoChip(
+              label: 'Assistant',
+              value: selectedAssistant.label,
+            ),
+            _ContextInfoChip(label: 'Model', value: selectedModel),
+            _ContextInfoChip(label: 'Reasoning', value: selectedReasoning),
+            _ContextInfoChip(label: 'Status', value: authLabel),
+            _ContextInfoChip(
+              label: 'Active runs',
+              value: activeRequests == 0 ? 'Idle' : '$activeRequests running',
+            ),
+          ],
+          actions: [
+            _ContextQuickAction(
+              icon: Icons.summarize_outlined,
+              label: 'Summarize context',
+              onTap: () => _appendComposerText(
+                ref,
+                'Summarize the current project context, taking the active file and selected UI target into account when they are relevant.',
+              ),
+            ),
+            _ContextQuickAction(
+              icon: Icons.route_outlined,
+              label: 'Plan next change',
+              onTap: () => _appendComposerText(
+                ref,
+                'Given the current project context, propose the next focused change that will move the work forward.',
+              ),
+            ),
+          ],
+          onClose: () => setState(() => _openSection = null),
+        );
+      case _ContextPanelSection.app:
+        return _ContextPanel(
+          icon: Icons.touch_app_outlined,
+          title: 'App preview',
+          summary: widget.interactionMode == PreviewInteractionMode.annotate
+              ? 'Inspector mode is active. Use the running preview and selected target to drive UI edits.'
+              : 'App interaction mode is active. Use the running preview when the current screen state matters.',
+          details: [
+            _ContextInfoChip(
+              label: 'Mode',
+              value: widget.interactionMode.label,
+            ),
+            _ContextInfoChip(
+              label: 'Target',
+              value: widget.inspectorLabel ?? 'No selected widget',
+            ),
+          ],
+          actions: [
+            _ContextQuickAction(
+              icon: Icons.mobile_friendly_outlined,
+              label: 'Use current app state',
+              onTap: () => _appendComposerText(
+                ref,
+                widget.interactionMode == PreviewInteractionMode.annotate &&
+                        widget.inspectorLabel != null
+                    ? 'Use the current app preview and the selected UI target as the main context for this request.'
+                    : 'Use the current running app preview as the main context for this request.',
+              ),
+            ),
+            _ContextQuickAction(
+              icon: Icons.brush_outlined,
+              label: 'Ask for UI polish',
+              onTap: () => _appendComposerText(
+                ref,
+                'Review the current app preview and suggest a focused UI polish pass covering spacing, hierarchy, and interaction details.',
+              ),
+            ),
+          ],
+          onClose: () => setState(() => _openSection = null),
+        );
+      case _ContextPanelSection.inspector:
+        return _ContextPanel(
+          icon: Icons.ads_click_outlined,
+          title: 'Inspector target',
+          summary: widget.inspectorLabel == null
+              ? 'No inspector target is attached yet. Select a widget in the preview to make UI requests more precise.'
+              : widget.inspectorLabel!,
+          details: [
+            _ContextInfoChip(
+              label: 'Selection',
+              value: widget.inspectorLabel ?? 'None',
+            ),
+          ],
+          actions: [
+            if (widget.inspectorLabel != null)
+              _ContextQuickAction(
+                icon: Icons.near_me_outlined,
+                label: 'Use selected target',
+                onTap: () => _appendComposerText(
+                  ref,
+                  'Focus on the currently selected UI target: ${widget.inspectorLabel}. Treat nearby visible UI around it as the primary editing surface.',
+                ),
+              ),
+            if (widget.onClearInspector != null)
+              _ContextQuickAction(
+                icon: Icons.close_rounded,
+                label: 'Clear target',
+                destructive: true,
+                onTap: widget.onClearInspector!,
+              ),
+          ],
+          onClose: () => setState(() => _openSection = null),
+        );
+      case _ContextPanelSection.files:
+        return _ContextPanel(
+          icon: Icons.insert_drive_file_outlined,
+          title: 'Files',
+          summary: widget.activeFilePath == null
+              ? (widget.projectRoot == null
+                    ? 'No project is attached yet.'
+                    : 'Project root: ${p.basename(widget.projectRoot!)}')
+              : activeFileLabel,
+          details: [
+            if (widget.projectRoot != null)
+              _ContextInfoChip(
+                label: 'Project',
+                value: p.basename(widget.projectRoot!),
+              ),
+            _ContextInfoChip(
+              label: 'Active file',
+              value: widget.activeFilePath == null ? 'None' : activeFileLabel,
+            ),
+          ],
+          actions: [
+            if (widget.activeFilePath != null)
+              _ContextQuickAction(
+                icon: Icons.notes_outlined,
+                label: 'Focus active file',
+                onTap: () => _appendComposerText(
+                  ref,
+                  'Focus on the active file: $activeFileLabel. Keep the work local to that file unless a nearby dependency clearly needs to change.',
+                ),
+              ),
+            _ContextQuickAction(
+              icon: Icons.folder_open_outlined,
+              label: 'Use project files',
+              onTap: () => _appendComposerText(
+                ref,
+                'Use the current project files as primary context and inspect the relevant implementation before proposing or making changes.',
+              ),
+            ),
+            if (widget.onClearActiveFile != null)
+              _ContextQuickAction(
+                icon: Icons.close_rounded,
+                label: 'Clear file',
+                destructive: true,
+                onTap: widget.onClearActiveFile!,
+              ),
+          ],
+          onClose: () => setState(() => _openSection = null),
+        );
+      case null:
+        return const SizedBox.shrink();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final projectLabel = projectRoot == null
-        ? 'No project selected'
-        : p.basename(projectRoot!);
-    final fileLabel = activeFilePath == null
-        ? 'No active file'
-        : activeFilePath!.split(RegExp(r'[/\\]')).last;
+    final hasProject =
+        widget.projectRoot != null && widget.projectRoot!.trim().isNotEmpty;
+    final hasFiles = hasProject || widget.activeFilePath != null;
+    final usingInspector =
+        widget.interactionMode == PreviewInteractionMode.annotate ||
+        widget.inspectorLabel != null;
 
     return Material(
       color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
-        decoration: BoxDecoration(
-          color: FloraPalette.panelBg.withValues(alpha: 0.96),
-          border: Border.all(color: FloraPalette.border),
-          borderRadius: BorderRadius.circular(10),
-          boxShadow: const [
-            BoxShadow(
-              color: Colors.black12,
-              blurRadius: 10,
-              offset: Offset(0, 3),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'CONTEXT',
+            style: TextStyle(
+              color: FloraPalette.textSecondary,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.1,
             ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Icon(
-                  Icons.layers_outlined,
-                  size: 13,
-                  color: FloraPalette.textSecondary,
-                ),
-                const SizedBox(width: 6),
-                const Text(
-                  'Context',
-                  style: TextStyle(
-                    color: FloraPalette.textSecondary,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.4,
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _ContextPill(
+                icon: Icons.blur_circular_outlined,
+                text: 'Context',
+                active: true,
+                showDot: true,
+                selected: _openSection == _ContextPanelSection.context,
+                onTap: () => _toggleSection(_ContextPanelSection.context),
+              ),
+              _ContextPill(
+                icon: Icons.touch_app_outlined,
+                text: 'Use App',
+                active: widget.interactionMode == PreviewInteractionMode.use,
+                selected: _openSection == _ContextPanelSection.app,
+                onTap: () => _toggleSection(_ContextPanelSection.app),
+              ),
+              _ContextPill(
+                icon: Icons.ads_click_outlined,
+                text: 'Inspector',
+                active: usingInspector,
+                selected: _openSection == _ContextPanelSection.inspector,
+                onTap: () => _toggleSection(_ContextPanelSection.inspector),
+              ),
+              _ContextPill(
+                icon: Icons.insert_drive_file_outlined,
+                text: 'Files',
+                active: hasFiles,
+                showChevron: true,
+                selected: _openSection == _ContextPanelSection.files,
+                onTap: () => _toggleSection(_ContextPanelSection.files),
+              ),
+            ],
+          ),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 180),
+            child: _openSection == null
+                ? const SizedBox.shrink()
+                : Padding(
+                    key: ValueKey(_openSection),
+                    padding: const EdgeInsets.only(top: 10),
+                    child: _buildExpandedPanel(),
                   ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: Wrap(
-                      alignment: WrapAlignment.end,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      spacing: 6,
-                      runSpacing: 2,
-                      children: [
-                        PopupMenuButton<String>(
-                          tooltip: 'Change Model',
-                          initialValue: model,
-                          onSelected: onModelChanged,
-                          offset: const Offset(0, 24),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
-                            side: const BorderSide(color: FloraPalette.border),
-                          ),
-                          color: FloraPalette.panelBg,
-                          itemBuilder: (context) {
-                            return modelOptions.map((m) {
-                              return PopupMenuItem<String>(
-                                value: m,
-                                height: 32,
-                                child: Text(
-                                  m,
-                                  style: FloraTheme.mono(
-                                    size: 11,
-                                    color: m == model
-                                        ? FloraPalette.textPrimary
-                                        : FloraPalette.textDimmed,
-                                  ),
-                                ),
-                              );
-                            }).toList();
-                          },
-                          child: Text(
-                            'model: $model',
-                            style: FloraTheme.mono(
-                              size: 10,
-                              color: FloraPalette.textSecondary,
-                            ).copyWith(decoration: TextDecoration.underline),
-                          ),
-                        ),
-                        Text(
-                          'provider: ${assistantProvider.label}',
-                          style: FloraTheme.mono(
-                            size: 10,
-                            color: FloraPalette.textSecondary,
-                          ),
-                        ),
-                        Text(
-                          'reasoning: $reasoningEffort',
-                          style: FloraTheme.mono(
-                            size: 10,
-                            color: FloraPalette.textSecondary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [
-                _ContextPill(
-                  icon: Icons.workspaces_outline,
-                  text: projectLabel,
-                ),
-                _ContextPill(
-                  icon: interactionMode == PreviewInteractionMode.annotate
-                      ? Icons.ads_click_outlined
-                      : Icons.touch_app_outlined,
-                  text: interactionMode.label,
-                ),
-                if (activeRequestCount > 0)
-                  _ContextPill(
-                    icon: Icons.sync_outlined,
-                    text:
-                        '$activeRequestCount run${activeRequestCount == 1 ? '' : 's'} active',
-                  ),
-                _ContextPill(
-                  icon: Icons.insert_drive_file_outlined,
-                  text: fileLabel,
-                  onClear: onClearActiveFile,
-                ),
-                if (inspectorLabel != null)
-                  _ContextPill(
-                    icon: Icons.ads_click_outlined,
-                    text: inspectorLabel!,
-                    onClear: onClearInspector,
-                  ),
-              ],
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 }
 
 class _ContextPill extends StatelessWidget {
-  const _ContextPill({required this.icon, required this.text, this.onClear});
+  const _ContextPill({
+    required this.icon,
+    required this.text,
+    this.active = false,
+    this.selected = false,
+    this.showDot = false,
+    this.showChevron = false,
+    this.onTap,
+  });
 
   final IconData icon;
   final String text;
-  final VoidCallback? onClear;
+  final bool active;
+  final bool selected;
+  final bool showDot;
+  final bool showChevron;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final fillColor = selected
+        ? FloraPalette.hoveredBg.withValues(alpha: 0.98)
+        : active
+        ? FloraPalette.inputBg.withValues(alpha: 0.78)
+        : FloraPalette.inputBg.withValues(alpha: 0.58);
+    final borderColor = selected
+        ? FloraPalette.accent.withValues(alpha: 0.4)
+        : FloraPalette.border;
+    final tone = selected || active
+        ? FloraPalette.textPrimary
+        : FloraPalette.textSecondary;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(11),
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 220),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          decoration: BoxDecoration(
+            color: fillColor,
+            border: Border.all(color: borderColor),
+            borderRadius: BorderRadius.circular(11),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 13, color: tone),
+              const SizedBox(width: 7),
+              Flexible(
+                child: Text(
+                  text,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: tone,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+              if (showDot) ...[
+                const SizedBox(width: 7),
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: const BoxDecoration(
+                    color: FloraPalette.accent,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+              if (showChevron) ...[
+                const SizedBox(width: 6),
+                Icon(Icons.chevron_right, size: 14, color: tone),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ContextPanel extends StatelessWidget {
+  const _ContextPanel({
+    required this.icon,
+    required this.title,
+    required this.summary,
+    required this.details,
+    required this.actions,
+    required this.onClose,
+  });
+
+  final IconData icon;
+  final String title;
+  final String summary;
+  final List<Widget> details;
+  final List<Widget> actions;
+  final VoidCallback onClose;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      constraints: const BoxConstraints(maxWidth: 260),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: FloraPalette.background,
+        color: FloraPalette.inputBg.withValues(alpha: 0.72),
         border: Border.all(color: FloraPalette.border),
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: BorderRadius.circular(14),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 12, color: FloraPalette.textSecondary),
-          const SizedBox(width: 5),
-          Flexible(
-            child: Text(
-              text,
-              overflow: TextOverflow.ellipsis,
-              style: FloraTheme.mono(
-                size: 10,
-                color: FloraPalette.textSecondary,
+          Row(
+            children: [
+              Icon(icon, size: 14, color: FloraPalette.textSecondary),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    color: FloraPalette.textPrimary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
               ),
+              InkWell(
+                onTap: onClose,
+                borderRadius: BorderRadius.circular(10),
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(
+                    Icons.close_rounded,
+                    size: 14,
+                    color: FloraPalette.textSecondary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            summary,
+            style: const TextStyle(
+              color: FloraPalette.textSecondary,
+              fontSize: 11,
+              height: 1.45,
             ),
           ),
-          if (onClear != null) ...[
-            const SizedBox(width: 4),
-            InkWell(
-              onTap: onClear,
-              child: const Icon(
-                Icons.close,
-                size: 12,
-                color: FloraPalette.textSecondary,
-              ),
-            ),
+          if (details.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Wrap(spacing: 8, runSpacing: 8, children: details),
+          ],
+          if (actions.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Wrap(spacing: 8, runSpacing: 8, children: actions),
           ],
         ],
+      ),
+    );
+  }
+}
+
+class _ContextInfoChip extends StatelessWidget {
+  const _ContextInfoChip({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(minWidth: 116, maxWidth: 240),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: FloraPalette.background.withValues(alpha: 0.44),
+        border: Border.all(color: FloraPalette.border),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label.toUpperCase(),
+            style: const TextStyle(
+              color: FloraPalette.textDimmed,
+              fontSize: 9,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.9,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: FloraPalette.textPrimary,
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ContextQuickAction extends StatelessWidget {
+  const _ContextQuickAction({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.destructive = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = destructive ? FloraPalette.error : FloraPalette.accent;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: accent.withValues(alpha: 0.12),
+            border: Border.all(color: accent.withValues(alpha: 0.22)),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 13, color: accent),
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: TextStyle(
+                  color: destructive
+                      ? FloraPalette.error
+                      : FloraPalette.textPrimary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1234,116 +1579,250 @@ class _EmptyChat extends StatelessWidget {
   }
 }
 
-class _MessageTile extends StatelessWidget {
+// ─── Follow-up helpers (used by _ChatBody) ───────────────────────────────────
+
+int _followUpCount(List<ChatMessage> messages) {
+  return _lastAssistantFollowUps(messages).isNotEmpty ? 1 : 0;
+}
+
+List<String> _lastAssistantFollowUps(List<ChatMessage> messages) {
+  for (int i = messages.length - 1; i >= 0; i--) {
+    final m = messages[i];
+    if (m.role == MessageRole.assistant && !m.isStreaming) {
+      return m.suggestedFollowUps;
+    }
+  }
+  return const [];
+}
+
+// ─── Suggested Follow-ups widget ─────────────────────────────────────────────
+
+class _SuggestedFollowUps extends StatelessWidget {
+  const _SuggestedFollowUps({
+    required this.suggestions,
+    required this.onSelect,
+  });
+
+  final List<String> suggestions;
+  final void Function(String text) onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    if (suggestions.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'SUGGESTED FOLLOW-UPS',
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              color: FloraPalette.textSecondary,
+              letterSpacing: 1.0,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ...suggestions.map(
+            (s) => Padding(
+              padding: const EdgeInsets.only(bottom: 5),
+              child: _FollowUpChip(text: s, onTap: () => onSelect(s)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FollowUpChip extends StatelessWidget {
+  const _FollowUpChip({required this.text, required this.onTap});
+
+  final String text;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: FloraPalette.inputBg.withValues(alpha: 0.72),
+          border: Border.all(color: FloraPalette.border),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                text,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: FloraPalette.textPrimary,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            const Icon(
+              Icons.north_east,
+              size: 12,
+              color: FloraPalette.textSecondary,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Message tile ─────────────────────────────────────────────────────────────
+
+class _MessageTile extends ConsumerWidget {
   const _MessageTile({required this.message});
 
   final ChatMessage message;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final isUser = message.role == MessageRole.user;
+    final senderLabel = isUser
+        ? 'You'
+        : (message.assistantProvider?.label ?? 'Assistant');
+    final initial = senderLabel[0].toUpperCase();
+    final avatarColor = isUser ? const Color(0xFF5771D8) : FloraPalette.accent;
     final debugTitle =
         '${message.assistantProvider?.label ?? 'Assistant'} debug';
-    final bubbleRadius = BorderRadius.only(
-      topLeft: const Radius.circular(18),
-      topRight: const Radius.circular(18),
-      bottomLeft: Radius.circular(isUser ? 18 : 6),
-      bottomRight: Radius.circular(isUser ? 6 : 18),
-    );
     final showCompletion =
         message.completionSummary != null &&
         message.completionSummary!.trim().isNotEmpty;
     final showThoughts = message.thoughts.isNotEmpty;
     final showDebug = message.debugLines.isNotEmpty && !message.isStreaming;
 
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.78,
-        ),
-        margin: EdgeInsets.only(
-          left: isUser ? 40 : 10,
-          right: isUser ? 10 : 40,
-          top: 4,
-          bottom: 4,
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: isUser ? FloraPalette.selectedBg : FloraPalette.panelBg,
-          border: Border.all(color: FloraPalette.border),
-          borderRadius: bubbleRadius,
-          boxShadow: const [
-            BoxShadow(
-              color: Colors.black12,
-              blurRadius: 4,
-              offset: Offset(0, 1),
+    return Container(
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: FloraPalette.border)),
+      ),
+      padding: const EdgeInsets.fromLTRB(12, 14, 12, 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: avatarColor,
+              shape: BoxShape.circle,
             ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (message.isStreaming) ...[
-              Row(
-                children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: const BoxDecoration(
-                      color: FloraPalette.accent,
-                      shape: BoxShape.circle,
+            alignment: Alignment.center,
+            child: Text(
+              initial,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      senderLabel,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: FloraPalette.textPrimary,
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 6),
-                  const Text(
-                    'Thinking live',
-                    style: TextStyle(
-                      color: FloraPalette.textSecondary,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
+                    if (message.isStreaming) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        width: 6,
+                        height: 6,
+                        decoration: const BoxDecoration(
+                          color: FloraPalette.accent,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      const Text(
+                        'thinking…',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: FloraPalette.textSecondary,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ],
+                    const Spacer(),
+                    _MessageActionButton(
+                      tooltip: 'Copy message',
+                      icon: Icons.content_copy_outlined,
+                      onTap: () => _copyMessage(context),
                     ),
+                    const SizedBox(width: 4),
+                    _MessageActionButton(
+                      tooltip: isUser ? 'Reuse as draft' : 'Draft a follow-up',
+                      icon: isUser ? Icons.edit_outlined : Icons.reply_outlined,
+                      onTap: () =>
+                          isUser ? _reuseAsDraft(ref) : _draftFollowUp(ref),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _formatTimestamp(message.timestamp),
+                      style: const TextStyle(
+                        fontSize: 10,
+                        color: FloraPalette.textDimmed,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                _buildContent(message.content),
+                if (message.inspectorAttachment != null) ...[
+                  const SizedBox(height: 8),
+                  _MessageInspectorAttachment(
+                    selection: message.inspectorAttachment!,
                   ),
                 ],
-              ),
-              const SizedBox(height: 8),
-            ],
-            _buildContent(message.content),
-            if (message.inspectorAttachment != null) ...[
-              const SizedBox(height: 8),
-              _MessageInspectorAttachment(
-                selection: message.inspectorAttachment!,
-              ),
-            ],
-            if (showThoughts) ...[
-              const SizedBox(height: 8),
-              _MessageMetaBlock(
-                icon: Icons.psychology_alt_outlined,
-                title: message.isStreaming
-                    ? 'Live thoughts'
-                    : 'Condensed thoughts',
-                lines: message.thoughts,
-              ),
-            ],
-            if (showCompletion) ...[
-              const SizedBox(height: 8),
-              _MessageMetaBlock(
-                icon: Icons.task_alt_outlined,
-                title: 'Completion',
-                lines: [message.completionSummary!.trim()],
-              ),
-            ],
-            if (showDebug) ...[
-              const SizedBox(height: 8),
-              _MessageMetaBlock(
-                icon: Icons.bug_report_outlined,
-                title: debugTitle,
-                lines: message.debugLines,
-                monospace: true,
-              ),
-            ],
-          ],
-        ),
+                if (showThoughts) ...[
+                  const SizedBox(height: 8),
+                  _MessageMetaBlock(
+                    icon: Icons.psychology_alt_outlined,
+                    title: message.isStreaming
+                        ? 'Live thoughts'
+                        : 'Condensed thoughts',
+                    lines: message.thoughts,
+                  ),
+                ],
+                if (showCompletion) ...[
+                  const SizedBox(height: 8),
+                  _MessageMetaBlock(
+                    icon: Icons.task_alt_outlined,
+                    title: 'Completion',
+                    lines: [message.completionSummary!.trim()],
+                  ),
+                ],
+                if (showDebug) ...[
+                  const SizedBox(height: 8),
+                  _MessageMetaBlock(
+                    icon: Icons.bug_report_outlined,
+                    title: debugTitle,
+                    lines: message.debugLines,
+                    monospace: true,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1404,11 +1883,81 @@ class _MessageTile extends StatelessWidget {
   }
 
   TextStyle _messageTextStyle() {
-    final isUser = message.role == MessageRole.user;
-    return TextStyle(
-      color: isUser ? Colors.white : FloraPalette.textPrimary,
+    return const TextStyle(
+      color: FloraPalette.textPrimary,
       fontSize: 13,
       height: 1.5,
+    );
+  }
+
+  Future<void> _copyMessage(BuildContext context) async {
+    final value = message.content.trim();
+    if (value.isEmpty) {
+      return;
+    }
+
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!context.mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        const SnackBar(
+          content: Text('Copied message to clipboard.'),
+          duration: Duration(milliseconds: 1200),
+        ),
+      );
+  }
+
+  void _reuseAsDraft(WidgetRef ref) {
+    _appendComposerText(ref, message.content, replace: true);
+  }
+
+  void _draftFollowUp(WidgetRef ref) {
+    final snippet = _summarizeConversationEntry(message.content, maxChars: 140);
+    _appendComposerText(
+      ref,
+      'Continue from this response and refine this point:\n$snippet',
+    );
+  }
+
+  static String _formatTimestamp(DateTime? ts) {
+    if (ts == null) return '';
+    final h = ts.hour % 12 == 0 ? 12 : ts.hour % 12;
+    final m = ts.minute.toString().padLeft(2, '0');
+    final ampm = ts.hour >= 12 ? 'PM' : 'AM';
+    return '$h:$m $ampm';
+  }
+}
+
+class _MessageActionButton extends StatelessWidget {
+  const _MessageActionButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onTap,
+  });
+
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Icon(icon, size: 14, color: FloraPalette.textSecondary),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -1571,29 +2120,71 @@ class _InputBar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final activeRequests = ref.watch(chatActiveRequestCountProvider);
+    final selectedAssistant = ref.watch(assistantProvider);
+    final projectRoot = ref.watch(projectRootProvider);
+    final interactionMode = ref.watch(previewInteractionModeProvider);
+    final activeFile = _projectScopedPath(
+      ref.watch(activeFilePathProvider),
+      projectRoot,
+    );
+    final inspectorSelection = _projectScopedInspectorSelection(
+      ref.watch(inspectorSelectionProvider),
+      projectRoot,
+    );
+    final usingCodex = selectedAssistant == AssistantProviderType.codex;
+    final providerReady = usingCodex
+        ? ref.watch(codexAuthenticatedProvider)
+        : ref.watch(copilotAuthenticatedProvider);
+    final onlineLabel = usingCodex ? 'Codex Online' : 'Command Code Online';
+
+    void insertSnippet(String text, {bool replace = false}) {
+      _appendComposerText(ref, text, replace: replace);
+      focus.requestFocus();
+    }
+
+    final filePrompt = activeFile == null
+        ? 'Use the current project files as context and inspect the most relevant implementation before making changes.'
+        : 'Focus on the active file: ${_projectRelativeLabel(activeFile, projectRoot)}. Keep the work local to that file unless a nearby dependency clearly needs to change.';
+    final appPrompt =
+        interactionMode == PreviewInteractionMode.annotate &&
+            inspectorSelection != null
+        ? 'Use the running app preview and the selected UI target as the primary context for this request.'
+        : 'Use the current app preview state as the primary context for this request.';
 
     return Container(
-      color: FloraPalette.panelBg,
-      padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      decoration: const BoxDecoration(
+        color: FloraPalette.panelBg,
+        border: Border(top: BorderSide(color: FloraPalette.border)),
+      ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           if (activeRequests > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 2, bottom: 6),
-              child: Text(
-                '$activeRequests run${activeRequests == 1 ? '' : 's'} active. Send another request or keep editing the draft.',
-                style: const TextStyle(
-                  color: FloraPalette.textSecondary,
-                  fontSize: 10,
+            Align(
+              alignment: Alignment.centerRight,
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  '$activeRequests run${activeRequests == 1 ? '' : 's'} active. Send another request or keep editing the draft.',
+                  style: const TextStyle(
+                    color: FloraPalette.textSecondary,
+                    fontSize: 10,
+                  ),
                 ),
               ),
             ),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: TextField(
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+            decoration: BoxDecoration(
+              color: FloraPalette.inputBg.withValues(alpha: 0.74),
+              border: Border.all(color: FloraPalette.border),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
                   controller: ctrl,
                   focusNode: focus,
                   maxLines: 5,
@@ -1601,30 +2192,128 @@ class _InputBar extends ConsumerWidget {
                   style: const TextStyle(
                     color: FloraPalette.textPrimary,
                     fontSize: 13,
+                    height: 1.45,
                   ),
                   decoration: InputDecoration(
                     hintText: placeholder,
-                    contentPadding: EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 8,
-                    ),
+                    filled: false,
+                    contentPadding: EdgeInsets.zero,
+                    border: InputBorder.none,
+                    enabledBorder: InputBorder.none,
+                    focusedBorder: InputBorder.none,
                   ),
                   onSubmitted: (_) => onSend(),
                   textInputAction: TextInputAction.send,
                 ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    _ComposerPill(
+                      icon: Icons.blur_circular_outlined,
+                      label: 'Context',
+                      active: true,
+                      onTap: () => insertSnippet(
+                        'Use the current project context, active file, and selected UI target when they are relevant.',
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    _ComposerPill(
+                      icon: Icons.touch_app_outlined,
+                      label: 'Use App',
+                      active: interactionMode == PreviewInteractionMode.use,
+                      onTap: () => insertSnippet(appPrompt),
+                    ),
+                    const SizedBox(width: 6),
+                    _ComposerPill(
+                      icon: Icons.insert_drive_file_outlined,
+                      label: 'Files',
+                      active: activeFile != null,
+                      onTap: () => insertSnippet(filePrompt),
+                    ),
+                    const Spacer(),
+                    Tooltip(
+                      message: 'Clear draft',
+                      child: InkWell(
+                        onTap: () {
+                          ctrl.clear();
+                          ref.read(chatComposerTextProvider.notifier).state =
+                              '';
+                          focus.requestFocus();
+                        },
+                        borderRadius: BorderRadius.circular(18),
+                        child: Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: FloraPalette.background.withValues(
+                              alpha: 0.6,
+                            ),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: FloraPalette.border),
+                          ),
+                          child: const Icon(
+                            Icons.close_rounded,
+                            size: 18,
+                            color: FloraPalette.textSecondary,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    InkWell(
+                      onTap: onSend,
+                      borderRadius: BorderRadius.circular(18),
+                      child: Container(
+                        width: 36,
+                        height: 36,
+                        decoration: const BoxDecoration(
+                          color: FloraPalette.accent,
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(
+                          Icons.arrow_outward_rounded,
+                          size: 18,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${selectedAssistant.label} uses context from your app and files to answer accurately.',
+                  style: const TextStyle(
+                    color: FloraPalette.textDimmed,
+                    fontSize: 10,
+                  ),
+                ),
               ),
               const SizedBox(width: 8),
-              InkWell(
-                onTap: onSend,
-                borderRadius: BorderRadius.circular(2),
-                child: Container(
-                  width: 32,
-                  height: 32,
-                  decoration: BoxDecoration(
-                    color: FloraPalette.accent,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                  child: const Icon(Icons.send, size: 14, color: Colors.white),
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: providerReady
+                      ? FloraPalette.success
+                      : FloraPalette.textDimmed,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                onlineLabel,
+                style: TextStyle(
+                  color: providerReady
+                      ? FloraPalette.success
+                      : FloraPalette.textSecondary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
             ],
@@ -1635,26 +2324,52 @@ class _InputBar extends ConsumerWidget {
   }
 }
 
-class _PaneHeader extends StatelessWidget {
-  const _PaneHeader({required this.label});
+class _ComposerPill extends StatelessWidget {
+  const _ComposerPill({
+    required this.icon,
+    required this.label,
+    this.active = false,
+    this.onTap,
+  });
 
+  final IconData icon;
   final String label;
+  final bool active;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: 28,
-      color: FloraPalette.sidebarBg,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Text(
-          label,
-          style: const TextStyle(
-            color: FloraPalette.textSecondary,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-            letterSpacing: 0.8,
+    return Tooltip(
+      message: label,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(999),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: active
+                  ? FloraPalette.hoveredBg.withValues(alpha: 0.86)
+                  : FloraPalette.background.withValues(alpha: 0.55),
+              border: Border.all(color: FloraPalette.border),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 12, color: FloraPalette.textSecondary),
+                const SizedBox(width: 6),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    color: FloraPalette.textSecondary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

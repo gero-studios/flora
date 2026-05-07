@@ -81,6 +81,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   StreamSubscription<String>? _devToolsStderrSub;
   Timer? _hotReloadDebounceTimer;
   Timer? _annotationRefreshTimer;
+  Timer? _inspectorSelectionSyncTimer;
 
   bool _appWebviewInitialized = false;
   bool _devToolsWebviewInitialized = false;
@@ -99,14 +100,17 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   String? _lastProjectRoot;
   bool _showSettings = false;
   bool _ctrlToggleArmed = false;
+  bool _widgetSelectorEnabled = false;
   bool _interactionModeBusy = false;
   bool _inspectorDefaultsApplied = false;
+  bool _inspectorSelectionPollInFlight = false;
   bool _loadingAnnotationSnapshot = false;
   bool _loadingSelectionDetails = false;
   InspectorTreeSnapshot? _annotationSnapshot;
   InspectorNodeLayoutDetails? _selectedLayoutDetails;
   Uint8List? _selectedScreenshotBytes;
   String? _selectedAnnotationStableKey;
+  InspectorSelectionContext? _suppressedPreviewSelection;
   _AnnotationNodeFilter _annotationFilter = _AnnotationNodeFilter.layout;
   int _annotationRefreshRequestId = 0;
 
@@ -128,6 +132,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     _devToolsProcess?.kill();
     _hotReloadDebounceTimer?.cancel();
     _annotationRefreshTimer?.cancel();
+    _inspectorSelectionSyncTimer?.cancel();
 
     if (_appWebviewInitialized) {
       _appWebview.dispose();
@@ -149,6 +154,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     _selectedAnnotationStableKey = null;
     _selectedLayoutDetails = null;
     _selectedScreenshotBytes = null;
+    _suppressedPreviewSelection = null;
   }
 
   Future<void> _loadApp(String url) async {
@@ -265,6 +271,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       _devToolsUrl = null;
       _inspectorDefaultsApplied = false;
       _ctrlToggleArmed = false;
+      _widgetSelectorEnabled = false;
       _interactionModeBusy = false;
       _loadingAnnotationSnapshot = false;
       _loadingSelectionDetails = false;
@@ -491,11 +498,15 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         _vmServiceUrl = detectedVmServiceUrl;
         if (changedSession) {
           _inspectorDefaultsApplied = false;
-          ref.read(previewInteractionModeProvider.notifier).state =
-              PreviewInteractionMode.use;
+          ref
+              .read(previewInteractionModeProvider.notifier)
+              .state = _activeTab == _PreviewTab.devTools
+              ? PreviewInteractionMode.annotate
+              : PreviewInteractionMode.use;
           _ctrlToggleArmed = false;
+          _widgetSelectorEnabled = false;
         }
-        _status = 'VM service detected. Preparing Flora screen map...';
+        _status = 'VM service detected. Preparing DevTools inspector...';
         unawaited(_applyInspectorDefaults());
       }
     }
@@ -585,14 +596,56 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   }
 
   void _openDevToolsTab() {
+    unawaited(_setActiveTab(_PreviewTab.devTools));
+  }
+
+  void _openAppTab() {
+    unawaited(_setActiveTab(_PreviewTab.app));
+  }
+
+  Future<void> _setActiveTab(_PreviewTab tab) async {
+    final previousTab = _activeTab;
+    final switchingTabs = previousTab != tab;
+
+    if (!switchingTabs && tab != _PreviewTab.devTools) {
+      return;
+    }
+
     setState(() {
-      _activeTab = _PreviewTab.devTools;
-      _status = 'Opening DevTools...';
+      _activeTab = tab;
+      _status = tab == _PreviewTab.devTools
+          ? 'Opening DevTools inspector...'
+          : 'App preview ready.';
     });
 
-    if (_vmServiceUrl != null && _devToolsProcess == null) {
-      unawaited(_ensureDevToolsRunning(_vmServiceUrl!));
+    ref
+        .read(previewInteractionModeProvider.notifier)
+        .state = tab == _PreviewTab.devTools
+        ? PreviewInteractionMode.annotate
+        : PreviewInteractionMode.use;
+
+    final vmServiceUrl = _vmServiceUrl;
+    if (!_runningFlutter || vmServiceUrl == null) {
+      return;
     }
+
+    _ctrlToggleArmed = false;
+    await _setWidgetSelectorEnabled(enabled: false, updateStatus: false);
+
+    if (tab == _PreviewTab.devTools) {
+      if (_devToolsProcess == null) {
+        await _ensureDevToolsRunning(vmServiceUrl);
+      }
+      return;
+    }
+
+    if (!mounted || _activeTab != _PreviewTab.app) {
+      return;
+    }
+
+    setState(() {
+      _status = 'App preview ready.';
+    });
   }
 
   void _handleDevToolsLine(String rawLine) {
@@ -667,6 +720,11 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       );
     }
 
+    if (_devToolsProcess == null &&
+        (_devToolsUrl == null || _devToolsUrl!.trim().isEmpty)) {
+      await _ensureDevToolsRunning(vmServiceUrl);
+    }
+
     if (!mounted) {
       return;
     }
@@ -675,66 +733,19 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       _inspectorDefaultsApplied = true;
       _interactionModeBusy = false;
       _status =
-          'Preview ready. Switch to Annotate UI to browse Flora\'s screen map.';
+          'Preview ready. Press Ctrl in the app preview to toggle widget selection on tap.';
     });
 
-    if (ref.read(previewInteractionModeProvider) ==
-        PreviewInteractionMode.annotate) {
-      unawaited(
-        _refreshAnnotationSnapshot(
-          preserveSelection: true,
-          statusOverride: 'Refreshing the current screen map...',
-        ),
-      );
-    }
+    await _startInspectorSelectionSync();
     _requestPreviewFocus();
   }
 
   Future<void> _setPreviewInteractionMode(PreviewInteractionMode mode) async {
-    final currentMode = ref.read(previewInteractionModeProvider);
-    if (_interactionModeBusy || currentMode == mode) {
-      return;
-    }
-
-    final vmServiceUrl = _vmServiceUrl;
-    ref.read(previewInteractionModeProvider.notifier).state = mode;
-
-    if (!_runningFlutter || vmServiceUrl == null) {
-      setState(() {
-        _status = mode == PreviewInteractionMode.annotate
-            ? 'Annotate UI will open once the preview is connected.'
-            : 'Use App mode ready.';
-      });
-      return;
-    }
-
-    setState(() {
-      _interactionModeBusy = true;
-      _activeTab = _PreviewTab.app;
-      _status = mode == PreviewInteractionMode.annotate
-          ? 'Building Flora screen map...'
-          : 'Returning to Use App mode...';
-    });
-
-    if (!mounted) {
-      return;
-    }
-
-    if (mode == PreviewInteractionMode.annotate) {
-      await _refreshAnnotationSnapshot(
-        preserveSelection: true,
-        statusOverride: 'Building Flora screen map...',
-      );
-    }
-
-    setState(() {
-      _interactionModeBusy = false;
-      _status = mode == PreviewInteractionMode.annotate
-          ? (_annotationSnapshot == null
-                ? 'Annotate UI ready. Refresh once the current screen settles.'
-                : 'Annotate UI ready. Browse the screen map below.')
-          : 'Use App mode on. Your selected target stays attached until you clear it.';
-    });
+    await _setActiveTab(
+      mode == PreviewInteractionMode.annotate
+          ? _PreviewTab.devTools
+          : _PreviewTab.app,
+    );
     _requestPreviewFocus();
   }
 
@@ -807,6 +818,129 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         _loadingAnnotationSnapshot = false;
         _status = 'Failed to refresh Flora\'s screen map.';
       });
+    }
+  }
+
+  Future<void> _startInspectorSelectionSync() async {
+    _inspectorSelectionSyncTimer?.cancel();
+
+    final vmServiceUrl = _vmServiceUrl;
+    if (vmServiceUrl == null || !_runningFlutter) {
+      return;
+    }
+
+    await _setWidgetSelectorEnabled(
+      enabled: false,
+      updateStatus: false,
+      force: true,
+    );
+
+    if (!mounted || _vmServiceUrl != vmServiceUrl) {
+      return;
+    }
+
+    _inspectorSelectionSyncTimer = Timer.periodic(
+      const Duration(milliseconds: 650),
+      (_) => unawaited(_syncInspectorSelectionFromPreview()),
+    );
+    unawaited(_syncInspectorSelectionFromPreview());
+  }
+
+  Future<void> _stopInspectorSelectionSync() async {
+    _inspectorSelectionSyncTimer?.cancel();
+    _inspectorSelectionSyncTimer = null;
+    _inspectorSelectionPollInFlight = false;
+    _suppressedPreviewSelection = null;
+
+    await _setWidgetSelectorEnabled(
+      enabled: false,
+      updateStatus: false,
+      force: true,
+    );
+  }
+
+  Future<void> _setWidgetSelectorEnabled({
+    required bool enabled,
+    bool updateStatus = true,
+    bool force = false,
+  }) async {
+    final vmServiceUrl = _vmServiceUrl;
+    if (vmServiceUrl == null || !_runningFlutter) {
+      return;
+    }
+
+    if (!force && _widgetSelectorEnabled == enabled) {
+      return;
+    }
+
+    final changed = await FlutterInspectorService.setInspectorSelectionMode(
+      vmServiceUrl: vmServiceUrl,
+      enabled: enabled,
+    );
+
+    if (!mounted || _vmServiceUrl != vmServiceUrl) {
+      return;
+    }
+
+    setState(() {
+      _widgetSelectorEnabled = changed ? enabled : false;
+      if (!updateStatus) {
+        return;
+      }
+
+      _status = _widgetSelectorEnabled
+          ? 'Widget selector on. Click a widget in the app preview.'
+          : 'Widget selector off. Scroll and navigate the app normally.';
+    });
+  }
+
+  Future<void> _syncInspectorSelectionFromPreview() async {
+    if (_inspectorSelectionPollInFlight) {
+      return;
+    }
+
+    final vmServiceUrl = _vmServiceUrl;
+    if (vmServiceUrl == null || !_runningFlutter) {
+      return;
+    }
+
+    _inspectorSelectionPollInFlight = true;
+    try {
+      final selection =
+          await FlutterInspectorService.fetchSelectedSummaryWidget(
+            vmServiceUrl: vmServiceUrl,
+          );
+      if (!mounted ||
+          _vmServiceUrl != vmServiceUrl ||
+          !_runningFlutter ||
+          selection == null) {
+        return;
+      }
+
+      final suppressedSelection = _suppressedPreviewSelection;
+      if (_sameInspectorSelection(suppressedSelection, selection)) {
+        return;
+      }
+
+      final currentSelection = ref.read(inspectorSelectionProvider);
+
+      final sameSelection = _sameInspectorSelection(
+        currentSelection,
+        selection,
+      );
+      if (sameSelection && _selectedAnnotationStableKey == null) {
+        return;
+      }
+
+      _applyInspectorSelection(selection);
+      setState(() {
+        _loadingSelectionDetails = false;
+        _selectedLayoutDetails = null;
+        _selectedScreenshotBytes = null;
+        _status = 'Selected ${selection.widgetName} from DevTools.';
+      });
+    } finally {
+      _inspectorSelectionPollInFlight = false;
     }
   }
 
@@ -978,17 +1112,31 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     return fragments.any(value.contains);
   }
 
+  void _applyInspectorSelection(
+    InspectorSelectionContext selection, {
+    String? stableKey,
+    bool remember = true,
+    bool syncActiveFile = true,
+  }) {
+    _selectedAnnotationStableKey = stableKey;
+    _suppressedPreviewSelection = null;
+    ref.read(inspectorSelectionProvider.notifier).state = selection;
+    if (remember) {
+      _rememberInspectorSelection(selection);
+    }
+    if (syncActiveFile &&
+        selection.sourceFile != null &&
+        selection.sourceFile!.trim().isNotEmpty) {
+      ref.read(activeFilePathProvider.notifier).state = selection.sourceFile;
+    }
+  }
+
   Future<void> _selectAnnotationNode(
     InspectorTreeNode node, {
     bool fromRefresh = false,
   }) async {
-    _selectedAnnotationStableKey = node.stableKey;
     final selection = node.toSelectionContext();
-    ref.read(inspectorSelectionProvider.notifier).state = selection;
-    _rememberInspectorSelection(selection);
-    if (node.sourceFile != null && node.sourceFile!.trim().isNotEmpty) {
-      ref.read(activeFilePathProvider.notifier).state = node.sourceFile;
-    }
+    _applyInspectorSelection(selection, stableKey: node.stableKey);
 
     setState(() {
       _loadingSelectionDetails = true;
@@ -1056,7 +1204,7 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   }
 
   KeyEventResult _onPreviewKeyEvent(FocusNode node, KeyEvent event) {
-    if (_showSettings || !_runningFlutter) {
+    if (_showSettings || !_runningFlutter || _activeTab != _PreviewTab.app) {
       return KeyEventResult.ignored;
     }
 
@@ -1068,20 +1216,17 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
       return KeyEventResult.ignored;
     }
 
-    if (event is KeyDownEvent) {
-      if (_ctrlToggleArmed) {
-        return KeyEventResult.handled;
-      }
-      _ctrlToggleArmed = true;
-      unawaited(_togglePreviewInteractionMode());
-      return KeyEventResult.handled;
-    }
-
     if (event is KeyUpEvent) {
       _ctrlToggleArmed = false;
       return KeyEventResult.handled;
     }
 
+    if (_ctrlToggleArmed) {
+      return KeyEventResult.handled;
+    }
+
+    _ctrlToggleArmed = true;
+    unawaited(_setWidgetSelectorEnabled(enabled: !_widgetSelectorEnabled));
     return KeyEventResult.handled;
   }
 
@@ -1137,13 +1282,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
   }
 
   void _selectInspectorTarget(InspectorSelectionContext selection) {
-    ref.read(inspectorSelectionProvider.notifier).state = selection;
-    _rememberInspectorSelection(selection);
-    if (selection.sourceFile != null &&
-        selection.sourceFile!.trim().isNotEmpty) {
-      ref.read(activeFilePathProvider.notifier).state = selection.sourceFile;
-    }
-
     final snapshot = _annotationSnapshot;
     if (snapshot != null) {
       final node = _findAnnotationNodeMatchingSelection(
@@ -1155,6 +1293,8 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         return;
       }
     }
+
+    _applyInspectorSelection(selection);
 
     setState(() {
       _status = 'Selected ${selection.widgetName} for follow-up changes.';
@@ -1178,15 +1318,19 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
 
   void _stopInspectorSync() {
     _annotationRefreshTimer?.cancel();
+    _inspectorSelectionSyncTimer?.cancel();
     _inspectorDefaultsApplied = false;
     _interactionModeBusy = false;
+    _inspectorSelectionPollInFlight = false;
     _ctrlToggleArmed = false;
+    _widgetSelectorEnabled = false;
     _loadingAnnotationSnapshot = false;
     _loadingSelectionDetails = false;
     _annotationSnapshot = null;
     _selectedLayoutDetails = null;
     _selectedScreenshotBytes = null;
     _selectedAnnotationStableKey = null;
+    _suppressedPreviewSelection = null;
     ref.read(previewInteractionModeProvider.notifier).state =
         PreviewInteractionMode.use;
   }
@@ -1244,20 +1388,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         _hotReloadDebounceTimer?.cancel();
         _hotReloadDebounceTimer = Timer(const Duration(milliseconds: 500), () {
           _sendFlutterCommand('r');
-          _annotationRefreshTimer?.cancel();
-          if (ref.read(previewInteractionModeProvider) ==
-              PreviewInteractionMode.annotate) {
-            _annotationRefreshTimer = Timer(
-              const Duration(milliseconds: 1100),
-              () => unawaited(
-                _refreshAnnotationSnapshot(
-                  preserveSelection: true,
-                  statusOverride:
-                      'Refreshing the screen map after hot reload...',
-                ),
-              ),
-            );
-          }
         });
       }
     });
@@ -1268,16 +1398,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
     final hasProjectRoot = (ref.watch(projectRootProvider) ?? '')
         .trim()
         .isNotEmpty;
-    final interactionMode = ref.watch(previewInteractionModeProvider);
-    final inspectorSelection = ref.watch(inspectorSelectionProvider);
-    final inspectorHistory = ref.watch(inspectorSelectionHistoryProvider);
-    final selectedAnnotationNode =
-        _annotationSnapshot == null || _selectedAnnotationStableKey == null
-        ? null
-        : _findAnnotationNodeByStableKey(
-            _annotationSnapshot!.rootNodes,
-            _selectedAnnotationStableKey!,
-          );
 
     return Focus(
       focusNode: _previewFocusNode,
@@ -1311,18 +1431,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
                         letterSpacing: 0.5,
                       ),
                     ),
-                    if (_runningFlutter) ...[
-                      const SizedBox(width: 8),
-                      Text(
-                        interactionMode == PreviewInteractionMode.annotate
-                            ? 'mode:annotate-ui'
-                            : 'mode:use-app',
-                        style: FloraTheme.mono(
-                          size: 10,
-                          color: FloraPalette.textDimmed,
-                        ),
-                      ),
-                    ],
                     const SizedBox(width: 12),
                     _BuildTypePill(
                       buildType: _selectedBuildType,
@@ -1351,6 +1459,18 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
 
                       if (_runningFlutter) ...[
                         const SizedBox(width: 8),
+                        _TabChip(
+                          label: 'App',
+                          active: _activeTab == _PreviewTab.app,
+                          onTap: _openAppTab,
+                        ),
+                        const SizedBox(width: 6),
+                        _TabChip(
+                          label: 'DevTools',
+                          active: _activeTab == _PreviewTab.devTools,
+                          onTap: _openDevToolsTab,
+                        ),
+                        const SizedBox(width: 8),
                         InkWell(
                           onTap: () => _sendFlutterCommand('r'),
                           child: const _ToolbarIcon(
@@ -1364,12 +1484,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
                             Icons.restart_alt,
                             tooltip: 'Hot Restart',
                           ),
-                        ),
-                        const SizedBox(width: 8),
-                        _InteractionModeToggle(
-                          mode: interactionMode,
-                          busy: _interactionModeBusy,
-                          onChanged: _setPreviewInteractionMode,
                         ),
                       ],
                     ],
@@ -1484,73 +1598,6 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
                   ),
                 ),
 
-              if (!_showSettings && _status != 'Idle' && _status.isNotEmpty)
-                Container(
-                  color: FloraPalette.panelBg,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 4,
-                  ),
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    _status,
-                    style: const TextStyle(
-                      fontSize: 10,
-                      color: FloraPalette.textSecondary,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-
-              if (_runningFlutter)
-                _AnnotationWorkbench(
-                  mode: interactionMode,
-                  snapshot: _annotationSnapshot,
-                  selection: inspectorSelection,
-                  selectedNode: selectedAnnotationNode,
-                  selectedLayoutDetails: _selectedLayoutDetails,
-                  selectedScreenshotBytes: _selectedScreenshotBytes,
-                  history: inspectorHistory,
-                  busy: _interactionModeBusy,
-                  loadingSnapshot: _loadingAnnotationSnapshot,
-                  loadingSelectionDetails: _loadingSelectionDetails,
-                  annotationFilter: _annotationFilter,
-                  searchController: _annotationSearchCtrl,
-                  onModeChanged: _setPreviewInteractionMode,
-                  onRefresh: () => _refreshAnnotationSnapshot(
-                    preserveSelection: true,
-                    statusOverride: 'Refreshing the current screen map...',
-                  ),
-                  onSearchChanged: (_) => setState(() {}),
-                  onFilterChanged: (nextFilter) => setState(() {
-                    _annotationFilter = nextFilter;
-                  }),
-                  onSelectNode: _selectAnnotationNode,
-                  onFocusSource: inspectorSelection == null
-                      ? null
-                      : () => _focusSelectionSource(inspectorSelection),
-                  onClearSelection: inspectorSelection == null
-                      ? null
-                      : () {
-                          ref.read(inspectorSelectionProvider.notifier).state =
-                              null;
-                          setState(() {
-                            _selectedAnnotationStableKey = null;
-                            _selectedLayoutDetails = null;
-                            _selectedScreenshotBytes = null;
-                            _status = 'Cleared the current UI target.';
-                          });
-                        },
-                  onQueuePrompt: inspectorSelection == null
-                      ? null
-                      : (template) => _queueAnnotationPrompt(
-                          template,
-                          inspectorSelection,
-                        ),
-                  onSelectHistory: _selectInspectorTarget,
-                ),
-
               Expanded(child: _buildBody()),
             ],
           ),
@@ -1611,67 +1658,14 @@ class _ProjectSidebarPaneState extends ConsumerState<ProjectSidebarPane> {
         icon: Icons.bug_report_outlined,
         title: 'No DevTools session',
         subtitle:
-            'Run & Load first, then open DevTools only when you need the raw Flutter inspector tools.',
+            'Run & Load first, then open DevTools to use the built-in Flutter widget inspector.',
         logs: _logs,
       );
     }
-
-    return Column(
-      children: [
-        Container(
-          height: 30,
-          color: FloraPalette.panelBg,
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          child: Row(
-            children: [
-              _TabChip(
-                label: 'App',
-                active: _activeTab == _PreviewTab.app,
-                onTap: () => setState(() => _activeTab = _PreviewTab.app),
-              ),
-              const SizedBox(width: 6),
-              _TabChip(
-                label: 'DevTools',
-                active: _activeTab == _PreviewTab.devTools,
-                onTap: _openDevToolsTab,
-              ),
-              const Spacer(),
-              if (_activeTab == _PreviewTab.app && _appUrl != null)
-                Flexible(
-                  child: Text(
-                    _appUrl!,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: FloraTheme.mono(
-                      size: 10,
-                      color: FloraPalette.textDimmed,
-                    ),
-                  ),
-                ),
-              if (_activeTab == _PreviewTab.devTools && _devToolsUrl != null)
-                Flexible(
-                  child: Text(
-                    _devToolsUrl!,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: FloraTheme.mono(
-                      size: 10,
-                      color: FloraPalette.textDimmed,
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: Webview(
-            _activeTab == _PreviewTab.app ? _appWebview : _devToolsWebview,
-            permissionRequested: (url, kind, isUser) =>
-                WebviewPermissionDecision.allow,
-          ),
-        ),
-      ],
+    return Webview(
+      _activeTab == _PreviewTab.app ? _appWebview : _devToolsWebview,
+      permissionRequested: (url, kind, isUser) =>
+          WebviewPermissionDecision.allow,
     );
   }
 }

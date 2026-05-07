@@ -20,16 +20,15 @@ void main() async {
   final storedCodexModel = prefs.getString('codex_model') ?? 'gpt-5.4-mini';
   final storedCodexReasoningEffort =
       prefs.getString('codex_reasoning_effort') ?? 'medium';
-  final storedCopilotModel = prefs.getString('copilot_model') ?? 'gpt-5.2';
+  final storedCopilotModel = prefs.getString('copilot_model') ?? 'gpt-5.4';
   final storedCopilotReasoningEffort =
       prefs.getString('copilot_reasoning_effort') ?? 'medium';
   var storedCopilotPermissionMode = copilotPermissionModeFromKey(
     prefs.getString('copilot_permission_mode'),
   );
   if (storedCopilotPermissionMode == CopilotPermissionMode.readOnly) {
-    // Prompt mode (-p) can no longer request permissions interactively, so a
-    // persisted read-only setting causes all edit attempts to fail. Migrate to
-    // workspace-write so Copilot can edit within the opened project.
+    // Command Code print mode is non-interactive, so a persisted read-only
+    // setting causes edit attempts to fail. Migrate to workspace-write.
     storedCopilotPermissionMode = CopilotPermissionMode.workspaceWrite;
   }
   final codexStatus = codexIntegrationEnabled
