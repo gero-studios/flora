@@ -30,6 +30,7 @@ const _copilotModelOptions = <String>[
   'moonshotai/Kimi-K2.6',
   'moonshotai/Kimi-K2.5',
   'zai-org/GLM-5.1',
+  'deepseek/deepseek-v4-pro',
 ];
 
 const _codexReasoningEffortOptions = <String>[

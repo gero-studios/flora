@@ -438,6 +438,14 @@ class CopilotCliService {
       final compactTaskBrief = _buildCompactTaskBrief(prompt);
       await taskFile.writeAsString(compactTaskBrief);
 
+      // Copy the task brief into the project root so Command Code can always
+      // find it even if --add-dir resolution fails on Windows.
+      final workspaceCopyPath =
+          p.join(workingDirectory, 'flora_task.md');
+      try {
+        await taskFile.copy(workspaceCopyPath);
+      } catch (_) {}
+
       final submittedPrimaryTask = _extractPrimaryTask(prompt);
       // Normalize path separators because prompt-mode @file mentions and tool
       // path parsing are more reliable with forward slashes on Windows.
@@ -461,14 +469,18 @@ class CopilotCliService {
         ..writeln('Return a concise summary of the result when finished.');
 
       final permissionArguments = _permissionArguments(permissionMode);
+      // Normalize --add-dir paths to forward slashes so Command Code
+      // resolves workspace boundaries correctly on Windows.
+      final normalizedWd = workingDirectory.replaceAll('\\', '/');
+      final normalizedTmp = tempDir.path.replaceAll('\\', '/');
 
       final arguments = <String>[
         '--print',
         driverPrompt.toString().trimRight(),
         '--add-dir',
-        workingDirectory,
+        normalizedWd,
         '--add-dir',
-        tempDir.path,
+        normalizedTmp,
         '--trust',
         '--skip-onboarding',
         '--verbose',
@@ -619,6 +631,13 @@ class CopilotCliService {
       if (tempDir != null && await tempDir.exists()) {
         await tempDir.delete(recursive: true);
       }
+      try {
+        final workspaceCopy =
+            File(p.join(workingDirectory, 'flora_task.md'));
+        if (await workspaceCopy.exists()) {
+          await workspaceCopy.delete();
+        }
+      } catch (_) {}
     }
   }
 

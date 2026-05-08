@@ -2087,6 +2087,8 @@ class _MessageMetaBlock extends StatelessWidget {
               padding: const EdgeInsets.only(bottom: 2),
               child: Text(
                 line,
+                maxLines: monospace ? 1 : 2,
+                overflow: TextOverflow.ellipsis,
                 style: monospace
                     ? FloraTheme.mono(
                         size: 10,
