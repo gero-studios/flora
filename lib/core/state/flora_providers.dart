@@ -16,6 +16,9 @@ final assistantProviderInitialProvider = Provider<AssistantProviderType>(
   (ref) => normalizeAssistantProvider(AssistantProviderType.codex),
 );
 
+/// Injected at startup from SharedPreferences (see main.dart).
+final onboardingCompleteInitialProvider = Provider<bool>((ref) => false);
+
 /// Injected at startup by probing the local Codex CLI installation.
 final codexInstalledInitialProvider = Provider<bool>((ref) => false);
 
@@ -66,6 +69,10 @@ final assistantProvider = StateProvider<AssistantProviderType>((ref) {
   return normalizeAssistantProvider(
     ref.watch(assistantProviderInitialProvider),
   );
+});
+
+final onboardingCompleteProvider = StateProvider<bool>((ref) {
+  return ref.watch(onboardingCompleteInitialProvider);
 });
 
 final codexInstalledProvider = StateProvider<bool>((ref) {

@@ -39,6 +39,11 @@ void main() async {
           message: 'Codex integration is temporarily disabled.',
         );
   final copilotStatus = await CopilotCliService.inspectStatus();
+  final onboardingCompletePreference = prefs.getBool('onboarding_complete');
+  final onboardingComplete = onboardingCompletePreference ??
+      (storedAssistantProvider == AssistantProviderType.codex
+          ? codexStatus.installed && codexStatus.authenticated
+          : copilotStatus.installed && copilotStatus.authenticated);
 
   runApp(
     ProviderScope(
@@ -47,6 +52,9 @@ void main() async {
         projectRootInitialProvider.overrideWithValue(storedProjectRoot),
         assistantProviderInitialProvider.overrideWithValue(
           storedAssistantProvider,
+        ),
+        onboardingCompleteInitialProvider.overrideWithValue(
+          onboardingComplete,
         ),
         codexInstalledInitialProvider.overrideWithValue(codexStatus.installed),
         codexAuthenticatedInitialProvider.overrideWithValue(

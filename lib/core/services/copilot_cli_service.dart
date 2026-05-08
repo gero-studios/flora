@@ -566,6 +566,10 @@ class CopilotCliService {
               eventTimeline,
               workingDirectory: workingDirectory,
               modifiedFiles: modifiedFiles,
+              onDiffDelta: (delta) {
+                linesAdded += delta.added;
+                linesRemoved += delta.removed;
+              },
             );
             emitProgress(status: progressStatus ?? 'Running Command Code…');
           })
@@ -693,6 +697,7 @@ class CopilotCliService {
     List<String> eventTimeline, {
     required String workingDirectory,
     required List<String> modifiedFiles,
+    required void Function(_DiffDelta delta) onDiffDelta,
   }) {
     final trimmed = _stripAnsi(line).trim();
     if (trimmed.isEmpty) {
@@ -701,6 +706,12 @@ class CopilotCliService {
 
     if (_isKnownCommandCodeCrashNoise(trimmed)) {
       return null;
+    }
+
+    final diffDelta = _parseVerboseDiffDelta(trimmed);
+    if (diffDelta != null) {
+      onDiffDelta(diffDelta);
+      eventTimeline.add('diff +${diffDelta.added} -${diffDelta.removed}');
     }
 
     final toolEvent = _parseVerboseToolEvent(
@@ -1040,7 +1051,7 @@ class CopilotCliService {
     required String workingDirectory,
   }) {
     final match = RegExp(
-      r'^(?:[✔✓]\s*)?(Read|View|Write|Edit|MultiEdit|Delete|Shell|PowerShell)\s*:\s*(.+)$',
+      r'^(?:[✔✓]\s*)?(Read|View|Create|Write|Edit|MultiEdit|Delete|Shell|PowerShell)\s*:\s*(.+)$',
       caseSensitive: false,
     ).firstMatch(line);
     if (match == null) {
@@ -1064,6 +1075,12 @@ class CopilotCliService {
         timelineLabel: 'tool.view',
         target: normalizedTarget,
         statusLabel: 'Reading task brief…',
+      ),
+      'create' => _VerboseToolEvent(
+        timelineLabel: 'tool.create',
+        target: normalizedTarget,
+        statusLabel: 'Updating files…',
+        isMutation: true,
       ),
       'write' => _VerboseToolEvent(
         timelineLabel: 'tool.write',
@@ -1101,6 +1118,45 @@ class CopilotCliService {
       ),
       _ => null,
     };
+  }
+
+  static _DiffDelta? _parseVerboseDiffDelta(String line) {
+    final normalized = line.toLowerCase();
+
+    final additionsDeletions = RegExp(
+      r'(\d+)\s+(?:line|lines)\s+added(?:,|\s+and\s+)\s*(\d+)\s+(?:line|lines)\s+removed',
+    ).firstMatch(normalized);
+    if (additionsDeletions != null) {
+      return _DiffDelta(
+        added: int.tryParse(additionsDeletions.group(1) ?? '') ?? 0,
+        removed: int.tryParse(additionsDeletions.group(2) ?? '') ?? 0,
+      );
+    }
+
+    final plusMinus = RegExp(
+      r'(?<!\d)\+(\d+)\s*(?:lines?|loc)?[,\s]+-(\d+)\s*(?:lines?|loc)?(?!\d)',
+    ).firstMatch(normalized);
+    if (plusMinus != null) {
+      return _DiffDelta(
+        added: int.tryParse(plusMinus.group(1) ?? '') ?? 0,
+        removed: int.tryParse(plusMinus.group(2) ?? '') ?? 0,
+      );
+    }
+
+    final additionsOnly = RegExp(
+      r'(\d+)\s+(?:line|lines)\s+added\b',
+    ).firstMatch(normalized);
+    final removalsOnly = RegExp(
+      r'(\d+)\s+(?:line|lines)\s+removed\b',
+    ).firstMatch(normalized);
+    if (additionsOnly != null || removalsOnly != null) {
+      return _DiffDelta(
+        added: int.tryParse(additionsOnly?.group(1) ?? '') ?? 0,
+        removed: int.tryParse(removalsOnly?.group(1) ?? '') ?? 0,
+      );
+    }
+
+    return null;
   }
 
   static String _normalizeReportedPath(
@@ -1188,4 +1244,11 @@ class _VerboseToolEvent {
   final String target;
   final String statusLabel;
   final bool isMutation;
+}
+
+class _DiffDelta {
+  const _DiffDelta({required this.added, required this.removed});
+
+  final int added;
+  final int removed;
 }

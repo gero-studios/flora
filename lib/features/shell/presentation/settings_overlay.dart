@@ -557,7 +557,7 @@ class _SettingsPanelState extends ConsumerState<_SettingsPanel> {
         ? 'Already Installed'
         : (usingCodex ? 'Install Codex CLI' : 'Install Command Code CLI');
     final signInLabel = !providerInstalled
-        ? (usingCodex ? 'Install Codex First' : 'Install Copilot First')
+        ? (usingCodex ? 'Install Codex First' : 'Install Command Code First')
         : providerAuthenticated
         ? 'Already Signed In'
         : (usingCodex ? 'Sign In With ChatGPT' : 'Sign In With GitHub');
